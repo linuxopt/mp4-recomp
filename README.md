@@ -240,6 +240,9 @@ from the same save), traced to a root cause and checked again in the game.
   - the scan counter's write-back copied 7.5 KB of GPU data over live game memory every frame, rolling it back; only the
     words the GPU actually changed are written back now.
 - **ZL lock-on** confirmed working (left trigger past about a quarter).
+- **Hard difficulty unlocked from the start.** On the Switch, Hard only opens after you finish the game. Setup now
+  applies a one-line patch (`beyond/beyond_patches.json`) so the difficulty screen reads that unlock flag as set. If
+  you already ran setup, run it again to get the patch.
 
 ### Audio
 

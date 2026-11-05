@@ -1,0 +1,18 @@
+{
+ "format": 2,
+ "files": {
+  "code_055.c": {
+   "pristine": "8c7589690c887b0c1ed5dc2c0a408e3dfaa247d7f643d6b7d115fb1c8000c8b9",
+   "result": "ea0fe581c2093c2fdc9a659c555eda2b8f76123d35b2a0f48b8cecfb70cd8f9b",
+   "hunks": [
+    [
+     39691,
+     39691,
+     [
+      " if((u32)c->x[27]==0xF19B0CAFu) c->x[23]=1;   /* Hard Mode always unlocked: the front end reads its unlock flag as set */"
+     ]
+    ]
+   ]
+  }
+ }
+}

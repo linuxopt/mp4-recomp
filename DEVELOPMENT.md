@@ -163,7 +163,10 @@ picture is enlarged to the window; FXAA and the CAS sharpening are skipped then 
     refresh). Diagnostics: `SWR_STALL_DUMP=1` (thread states when frames stop), slow GPU methods / GL calls in the log.
 19. Now: the loading icon, the intro video, the publisher logo, the title screen and the first area run; the game runs without stopping
    (40 s tested). **Next**: play past the boot sequence (title screen, input, saves, the first area) and fix what
-   comes up there, plus game-specific patches (`beyond/beyond_patches.json`, empty for now).
+   comes up there, plus game-specific patches (`beyond/beyond_patches.json`). The first one makes Hard selectable from
+   the start: the front end's logic graph lights the Hard button from a bridge node (`F_8686740`, `code_055.c`) that
+   sends one bool per key, and the patch makes it send true for key `0xF19B0CAF`, the unlock flag. That key feeds only
+   the Hard chain in the front end; whether gameplay reads it too is not checked yet.
 
 Test loop used during bring-up: build the runtime without the Play screen (`SWR_NO_LINUX_FRONTEND=1`), copy it next to
 the compiled game and read `Metroid Prime 4 Beyond.log`.
