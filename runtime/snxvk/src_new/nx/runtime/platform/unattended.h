@@ -21,13 +21,16 @@ int unattended_active(void);
 /* The buttons the options press now, as HidNpadButton bits, plus bits 40 to 47 for stick directions (see
    input_key_sticks) */
 u64 unattended_buttons(void);
+/* a scripted press of this bit is Home: it opens the game's menu and closes it, and while it is open the scripted
+   buttons move it as a pad's do (so a run can test the menu) */
+#define SNX_SCRIPT_HOME (1ull << 48)
 const char* unattended_shot(void); /* the shot path without its extension, or NULL */
 /* 1 when shot_every asks for a numbered screenshot now, its path (no extension) written into path */
 int unattended_periodic_shot(char* path, size_t n);
 int unattended_done(void); /* 1 once the frame count or the time is reached */
 /* Ends the run: prints the frame count, the last image's hash and its size (w and h 0 when not known) on stderr, saves
    what a clean exit saves, and exits with 0 */
-__attribute__((noreturn)) void unattended_exit(u64 hash, int w, int h);
+_Noreturn void unattended_exit(u64 hash, int w, int h);
 
 /* Stick directions held like keys, bits 40 to 47 of k (left, up, right, down of the left stick, then of the right),
    as full deflections in st = {lx, ly, rx, ry}; opposite directions cancel */

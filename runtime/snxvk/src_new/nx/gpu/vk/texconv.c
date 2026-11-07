@@ -64,18 +64,23 @@ static u32 tc_mode(const VkFmt* f) {
         case VKC_D32S8: return TC_D32S8;
         case VKC_NONE: return f->bpp == 8 ? TC_D32S8 : TC_D24S8; /* a depth and stencil format as it is in memory */
     }
-    return TC_ETC2_RGB + (f->conv - VKC_ETC2); /* the ETC2 and EAC kinds, in the same order */
+    /* the ETC2 and EAC kinds, and the BCn ones, each in the same order */
+    return f->conv >= VKC_BC1 ? TC_BC1 + (f->conv - VKC_BC1) : TC_ETC2_RGB + (f->conv - VKC_ETC2);
 }
 
-int vk_tc_converts(const VkFmt* f) {
-    return f->conv == VKC_NONE ? f->depth && f->stencil : f->conv != VKC_ASTC;
-}
+int vk_tc_converts(const VkFmt* f) { return f->conv == VKC_NONE ? f->depth && f->stencil : f->conv != VKC_ASTC; }
 
 static VkTcShape tc_shape(u32 mode, u32 w) {
     VkTcShape s = {.out_bpp = 4, .out_rows = 1, .in_align = 16};
     if (mode <= TC_A5B5G5R1 || (mode >= TC_VI_RGB565 && mode <= TC_VI_RGBA4444)) {
         s.units = (w + 1) / 2;
         s.out_texels = s.units * 2;
+    } else if (mode >= TC_BC1 && mode <= TC_BC7) {
+        s.units = (w + 3) / 4;
+        s.out_texels = s.units * 4;
+        s.out_rows = 4;
+        if (mode == TC_BC4 || mode == TC_BC4_SNORM) s.out_bpp = 2;
+        if (mode == TC_BC6H_UF || mode == TC_BC6H_SF) s.out_bpp = 8;
     } else if (mode >= TC_VI_RGBX8888) {
         s.units = s.out_texels = w;
     } else if (mode == TC_RGB32F) {
@@ -174,8 +179,8 @@ static int tc_record(VkCommandBuffer cb, u32 mode, u32 zfloat, u32 w, u32 rows, 
                        in_at + (u64)in_pitch * rows * slices - in_off, out, out_off,
                        out_at + vk_tc_out_size(&s, rows, slices) - out_off);
 }
-int vk_tc_nv12_uv(VkCommandBuffer cb, u32 pairs, u32 rows, VkBuffer in, u64 u_at, u64 v_at, u32 in_pitch,
-                  VkBuffer out, u64 out_at, u32 out_pitch) {
+int vk_tc_nv12_uv(VkCommandBuffer cb, u32 pairs, u32 rows, VkBuffer in, u64 u_at, u64 v_at, u32 in_pitch, VkBuffer out,
+                  u64 out_at, u32 out_pitch) {
     u64 align = storage_align(), lo = u_at < v_at ? u_at : v_at, hi = (u_at > v_at ? u_at : v_at);
     u64 in_off = lo & ~(align - 1), out_off = out_at & ~(align - 1);
     u32 units = (pairs + 3) / 4;
@@ -189,11 +194,11 @@ int vk_tc_nv12_uv(VkCommandBuffer cb, u32 pairs, u32 rows, VkBuffer in, u64 u_at
                   .in_bias = (u32)((u_at - in_off) / 4),
                   .out_bias = (u32)((out_at - out_off) / 4),
                   .st_bias = (u32)((v_at - in_off) / 4)};
-    return tc_dispatch(cb, &p, (units + 63) / 64, rows, 1, in, in_off, hi + (u64)in_pitch * rows - in_off, out,
-                       out_off, out_at + (u64)out_pitch * rows - out_off);
+    return tc_dispatch(cb, &p, (units + 63) / 64, rows, 1, in, in_off, hi + (u64)in_pitch * rows - in_off, out, out_off,
+                       out_at + (u64)out_pitch * rows - out_off);
 }
-int vk_tc_convert(VkCommandBuffer cb, const VkFmt* f, u32 w, u32 rows, u32 slices, VkBuffer in, u64 in_at,
-                  u32 in_pitch, VkBuffer out, u64 out_at) {
+int vk_tc_convert(VkCommandBuffer cb, const VkFmt* f, u32 w, u32 rows, u32 slices, VkBuffer in, u64 in_at, u32 in_pitch,
+                  VkBuffer out, u64 out_at) {
     u32 mode = tc_mode(f);
     /* 24 bit depth into D32_SFLOAT_S8_UINT, where D24S8 isn't supported, goes out as a float */
     u32 zfloat = f->vk == VK_FORMAT_D32_SFLOAT_S8_UINT && mode != TC_D32S8;
@@ -225,22 +230,63 @@ int vk_tc_dma_remap(VkCommandBuffer cb, const GpuDmaOp* o, u32 lines, VkBuffer i
     return tc_dispatch(cb, &p, (units + 63) / 64, lines, 1, in, in_off, (in_size + 3) & ~3ull, out, out_off,
                        out_at + (u64)out_pitch * lines - out_off);
 }
-int vk_tc_blit(VkCommandBuffer cb, u32 bpp, u32 nb, u32 rows, VkBuffer in, u64 in_size, u64 src_at, u32 in_pitch,
-               u64 col_at, u64 row_at, VkBuffer out, u64 out_at, u32 out_pitch) {
+int vk_tc_blit(VkCommandBuffer cb, u32 bpp, u32 fmt, u32 nb, u32 rows, VkBuffer in, u64 in_size, u64 src_at,
+               u32 in_pitch, u64 col_at, u64 row_at, VkBuffer out, u64 out_at, u32 out_pitch) {
     u64 out_off = out_at & ~(storage_align() - 1);
     u32 units = (nb + 3) / 4;
     if ((col_at | row_at | out_at | out_pitch) & 3) return 0;
-    TcParams p = {.mode = TC_BLIT,
+    TcParams p = {.mode = (fmt & GPU_BLIT_CONVERT_BIT) ? TC_BLIT_CONVERT
+                          : fmt                        ? TC_BLIT_FLOAT
+                                                       : TC_BLIT,
                   .units = units,
                   .rows = rows,
                   .in_pitch = in_pitch, /* bytes, for this mode */
                   .out_pitch = out_pitch / 4,
                   .in_bias = (u32)src_at,
                   .out_bias = (u32)((out_at - out_off) / 4),
-                  .remap = bpp,
+                  .remap = fmt ? fmt : bpp,
                   .const_a = (u32)(col_at / 4),
                   .const_b = (u32)(row_at / 4),
                   .line_out = nb};
     return tc_dispatch(cb, &p, (units + 63) / 64, rows, 1, in, 0, (in_size + 3) & ~3ull, out, out_off,
                        out_at + (u64)out_pitch * rows - out_off);
+}
+int vk_tc_index(VkCommandBuffer cb, u32 mode, u32 remap, u32 restart, u32 n, VkBuffer in, u64 in_at, u64 in_size,
+                VkBuffer out, u64 out_at, u64 out_size) {
+    u64 align = storage_align(), in_off = in_at & ~(align - 1), out_off = out_at & ~(align - 1);
+    /* rows of at most 65,535 workgroups, the least maxComputeWorkGroupCount[0] the specification allows */
+    u32 units = n < 65535u * 64 ? n : 65535u * 64, rows = n ? (n + units - 1) / units : 0;
+    if ((in_at | out_at) & 3) return 0;
+    if (!n) return 1;
+    TcParams p = {.mode = mode,
+                  .units = units,
+                  .rows = rows,
+                  .in_bias = (u32)(in_at - in_off), /* bytes, for these modes */
+                  .out_bias = (u32)((out_at - out_off) / 4),
+                  .remap = remap,
+                  .const_a = restart,
+                  .line_out = n};
+    /* a word of input still binds when there is none (vertex numbers made into quads) */
+    return tc_dispatch(cb, &p, (units + 63) / 64, rows, 1, in, in_off,
+                       (in_at + (in_size ? in_size : 4) - in_off + 3) & ~3ull, out, out_off,
+                       out_at + out_size - out_off);
+}
+int vk_tc_restride(VkCommandBuffer cb, u32 in_stride, u32 out_stride, u32 nv, VkBuffer in, u64 in_at, u64 len,
+                   VkBuffer out, u64 out_at) {
+    u64 align = storage_align(), in_off = in_at & ~(align - 1), out_off = out_at & ~(align - 1);
+    u64 n = (u64)nv * (out_stride / 4), in_end = (in_at + len + 3) & ~3ull;
+    if ((out_stride | out_at) & 3 || !out_stride || n > 0xFFFFFFFFu || len > 0xFFFFFFFFu) return 0;
+    if (!n) return 1;
+    u32 units = n < 65535u * 64 ? (u32)n : 65535u * 64, rows = (u32)((n + units - 1) / units);
+    TcParams p = {.mode = TC_RESTRIDE,
+                  .units = units,
+                  .rows = rows,
+                  .in_pitch = in_stride, /* bytes, for this mode */
+                  .out_pitch = out_stride / 4,
+                  .in_bias = (u32)(in_at - in_off), /* bytes */
+                  .out_bias = (u32)((out_at - out_off) / 4),
+                  .const_a = (u32)len,
+                  .line_out = (u32)n};
+    return tc_dispatch(cb, &p, (units + 63) / 64, rows, 1, in, in_off, in_end - in_off, out, out_off,
+                       out_at + n * 4 - out_off);
 }

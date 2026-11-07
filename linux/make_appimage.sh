@@ -29,7 +29,7 @@ fetch python.tar.gz "$PY_URL" "$PY_SHA"
 fetch appimagetool "$TOOL_URL"
 chmod +x "$C/appimagetool"
 
-# the runtime as released on Windows (SWR_RELEASE: no frame generation, no DLSS notes), with the front end. Built with
+# the runtime as released on Windows (SWR_RELEASE: no frame generation), with the front end. Built with
 # the same Bootlin GCC (glibc 2.41, generic x86-64), not the distro's: a distro build needs that distro's glibc, and its
 # CPU level when the distro is built for one (CachyOS znver4's crt files and libstdc++ made it x86-64-v4: "CPU ISA level
 # is lower than required" on a Steam Deck). X11, GL, FFmpeg and Vulkan headers come from this machine after the
@@ -45,7 +45,7 @@ for l in X11 GL; do f=$(ls /usr/lib/lib$l.so.? /usr/lib64/lib$l.so.? /usr/lib/x8
 # different ID after an update asks for the rebuild
 VERSION=$(date -u +%Y.%m.%d.%H%M)
 COMMIT=$(git -C "$W" rev-parse --short HEAD 2>/dev/null || echo unknown); git -C "$W" diff --quiet HEAD 2>/dev/null || COMMIT="$COMMIT-modified"
-RID=$( { cat "$W"/{switchrecomp,codegen,a64,nxloader,metroid_perf}.py "$W/beyond/fov_hooks.txt" "$W/runtime/cpu.h" "$W/runtime/cpu_helpers.c" "$W/linux/lx_compat.h"
+RID=$( { cat "$W"/{switchrecomp,codegen,a64,nxloader,metroid_perf,logic_rate,mouse_aim}.py "$W/beyond/fov_hooks.txt" "$W/runtime/cpu.h" "$W/runtime/cpu_helpers.c" "$W/linux/lx_compat.h"
          [ -f "$W/beyond/beyond_patches.json" ] && cat "$W/beyond/beyond_patches.json"; echo "$GCC_SHA"; } | sha256sum | cut -c1-16)
 rm -f "$RUNTIME"   # so a failed build cannot leave the distro-built one in place
 SWR_RUNTIME_CC="$BGCC" SWR_RUNTIME_DEFS="-idirafter $SI -L$SL -Wl,--allow-shlib-undefined -DSWR_APPIMAGE_VERSION=\"$VERSION\" -DSWR_APPIMAGE_COMMIT=\"$COMMIT\" -DSWR_RECOMPILER_ID=\"$RID\"" SWR_RELEASE=1 \
@@ -59,7 +59,7 @@ grep -qa "FIRST-TIME SETUP" "$RUNTIME" || { echo "error: the runtime was built w
 rm -rf "$A"; mkdir -p "$A/usr/bin" "$R/beyond" "$R/runtime" "$R/linux" "$A/usr/share/metroid-prime-4-recomp/licenses"
 cp "$RUNTIME" "$A/usr/bin/metroid-prime-4-recomp"
 # the recompiler, laid out as beyond_setup.py expects it (as in the Windows release's recompiler folder)
-cp "$W"/{switchrecomp,codegen,a64,nxloader,metroid_perf}.py "$W/beyond/beyond_setup.py" "$R/"
+cp "$W"/{switchrecomp,codegen,a64,nxloader,metroid_perf,logic_rate,mouse_aim}.py "$W/beyond/beyond_setup.py" "$R/"
 cp "$W/beyond/romfs_beyond.manifest" "$W/beyond/fov_hooks.txt" "$R/beyond/"
 [ -f "$W/beyond/beyond_patches.json" ] && cp "$W/beyond/beyond_patches.json" "$R/beyond/"   # game-code patches, once there are any
 cp "$W/runtime/cpu.h" "$W/runtime/cpu_helpers.c" "$R/runtime/"

@@ -13,6 +13,7 @@ Uncommon AdvSIMD ops call swr_simd() (hand written C, tested against Unicorn lik
 the common ones are inlined.
 """
 import itertools
+import os
 
 FIELDS = {
     'rd': (0, 5), 'rn': (5, 5), 'rm': (16, 5), 'ra': (10, 5), 'rt': (0, 5), 'rt2': (10, 5), 'rs': (16, 5),
@@ -864,7 +865,11 @@ def _(g): return simd_fallback(g)
 
 
 @ins('SIMD_LDST1', '0 x 0011 0 1x x xxxxxx xxxx xx xxxxx xxxxx')
-def _(g): return simd_fallback(g)
+def _(g):
+    if g.static:
+        f = fast_ld1_single(g)
+        if f: return f
+    return simd_fallback(g)
 
 
 def fast_simd(g):
@@ -961,16 +966,314 @@ def fast_simd(g):
     return None
 
 
+# Second tier of inline AdvSIMD, for the ops games run per vector (compare masks, pairwise and min/max,
+# reciprocal steps, by-element FMULX, conversions, EXT/ZIP/UZP/TRN, scalar DUP, MOVI, single-lane LD1/ST1).
+# Each template mirrors, expression for expression, the swr_simd path in cpu_helpers.c that would run the
+# same word: lanes widen to f64 exactly as rdf() does and narrow as wrf() does, the same fp_* helpers do
+# the hard cases, and an encoding swr_simd rejects stays a swr_simd call. The results, NaN payloads
+# included, are the same as the call they replace. Off by default: SWR_SIMD_INLINE=1 at generation time turns it on
+# (one unexplained guest deadlock in four benchmark runs with it on, never seen without it).
+SIMD_INLINE2 = os.environ.get('SWR_SIMD_INLINE', '0') == '1'
+
+
+def simd_route(w):
+    """The swr_simd helper that handles w, tested in the same order as swr_simd itself."""
+    if (w & 0xBF800000) in (0x0C000000, 0x0C800000) or (w & 0xBF000000) == 0x0D000000: return 'ldst'
+    if (w & 0x9F200400) == 0x0E200400: return '3same'
+    if (w & 0xDF200400) == 0x5E200400: return '3same_s'
+    if (w & 0x9F200C00) == 0x0E200000: return '3diff'
+    if (w & 0xDF200C00) == 0x5E200000: return '3diff_s'
+    if (w & 0x9F3E0C00) == 0x0E200800: return '2misc'
+    if (w & 0xDF3E0C00) == 0x5E200800: return '2misc_s'
+    if (w & 0x9F3E0C00) == 0x0E300800: return 'across'
+    if (w & 0xDF3E0C00) == 0x5E300800: return 'pairwise_s'
+    if (w & 0x9FE08400) == 0x0E000400: return 'copy'
+    if (w & 0xFFE0FC00) == 0x5E000400: return 'dup_s'
+    if (w & 0x9FF80400) == 0x0F000400: return 'modimm'
+    if (w & 0x9F800400) == 0x0F000400: return 'shimm'
+    if (w & 0xDF800400) == 0x5F000400: return 'shimm_s'
+    if (w & 0x9F000400) == 0x0F000000: return 'elem'
+    if (w & 0xDF000400) == 0x5F000000: return 'elem_s'
+    if (w & 0xBF208C00) == 0x0E000800: return 'perm'
+    if (w & 0xBFE08400) == 0x2E000000: return 'ext'
+    return None
+
+
+LANE = {0: ('b', 'u8'), 1: ('h', 'u16'), 2: ('s', 'u32'), 3: ('d', 'u64')}
+
+
+def _rdf(v, sz, i):
+    """rdf(): a lane as f64"""
+    return '%s.df[%d]' % (v, i) if sz else '(f64)%s.f[%d]' % (v, i)
+
+
+def _wrf(sz, i, e):
+    """wrf(): store an f64 into an fp lane of r"""
+    return 'r.df[%d]=%s; ' % (i, e) if sz else 'r.f[%d]=(f32)(%s); ' % (i, e)
+
+
+def _mask(sz, i, cond):
+    """eset(&r, sz?3:2, i, fcmpmask(...))"""
+    return 'r.d[%d]=(%s)? ~0ull : 0; ' % (i, cond) if sz else 'r.s[%d]=(%s)? 0xFFFFFFFFu : 0; ' % (i, cond)
+
+
+def _fhelper(name, sz, x, y):
+    """fmax_/fmin_/... and fop2 cases 9-11: the f32 helper on narrowed operands, or the f64 one"""
+    return '%s64(%s,%s)' % (name, x, y) if sz else '(f64)%s32((f32)%s,(f32)%s)' % (name, x, y)
+
+
+# simd_3same fp table: (U, size>>1) -> op -> (sel, cmp, acc, pair)
+F3SAME = {
+    (0, 0): {0x18: (6, -1, 0, 0), 0x19: (-1, -1, 1, 0), 0x1A: (0, -1, 0, 0), 0x1B: (9, -1, 0, 0), 0x1C: (-1, 0, 0, 0),
+             0x1E: (4, -1, 0, 0), 0x1F: (10, -1, 0, 0)},
+    (0, 1): {0x18: (7, -1, 0, 0), 0x19: (-1, -1, 2, 0), 0x1A: (1, -1, 0, 0), 0x1E: (5, -1, 0, 0), 0x1F: (11, -1, 0, 0)},
+    (1, 0): {0x18: (6, -1, 0, 1), 0x1A: (0, -1, 0, 1), 0x1B: (2, -1, 0, 0), 0x1C: (-1, 1, 0, 0), 0x1D: (-1, 3, 0, 0),
+             0x1E: (4, -1, 0, 1), 0x1F: (3, -1, 0, 0)},
+    (1, 1): {0x18: (7, -1, 0, 1), 0x1A: (8, -1, 0, 0), 0x1C: (-1, 2, 0, 0), 0x1D: (-1, 4, 0, 0), 0x1E: (5, -1, 0, 1)},
+}
+FOP2 = {0: 'x+y', 1: 'x-y', 2: 'x*y', 3: 'x/y'}
+FOP2_HELPER = {4: 'fp_max', 5: 'fp_min', 6: 'fp_maxnm', 7: 'fp_minnm', 9: 'fp_mulx', 10: 'fp_recps', 11: 'fp_rsqrts'}
+FCMP = {0: 'x==y', 1: 'x>=y', 2: 'x>y', 3: '(x<0?-x:x)>=(y<0?-y:y)', 4: '(x<0?-x:x)>(y<0?-y:y)', 5: 'x<=y', 6: 'x<y'}
+
+
+def _f3same(w, scalar):
+    Q = 0 if scalar else (w >> 30) & 1
+    U = (w >> 29) & 1; size = (w >> 22) & 3; rm = (w >> 16) & 31; op = (w >> 11) & 31; rn = (w >> 5) & 31; rd = w & 31
+    sz = size & 1
+    n = 1 if scalar else (2 if sz else (4 if Q else 2))
+    if sz and not Q and not scalar: return None
+    t = F3SAME[(U, size >> 1)].get(op)
+    if t is None: return None
+    sel, cmp, acc, pair = t
+    if scalar and (pair or acc or 0 <= sel <= 7): return None
+    # FMAXNM/FMINNM stay calls: swr_simd quiets a signalling NaN on its way through f64, so a number wins against
+    # it there, and GCC drops that round trip from inline code. Rare in game code, so no gain worth a difference
+    if sel in (6, 7): return None
+    s = '{ V128 a=c->v[%d], b=c->v[%d], %sr; r.d[0]=0; r.d[1]=0; ' % (rn, rm, 'd=c->v[%d], ' % rd if acc else '')
+    for i in range(n):
+        if pair:
+            h = n // 2; v = 'a' if i < h else 'b'; k = (i if i < h else i - h) * 2
+            x, y = _rdf(v, sz, k), _rdf(v, sz, k + 1)
+        else:
+            x, y = _rdf('a', sz, i), _rdf('b', sz, i)
+        s += '{ f64 x=%s, y=%s; ' % (x, y)
+        if cmp >= 0: s += _mask(sz, i, FCMP[cmp])
+        elif acc:
+            d = _rdf('d', sz, i); xa = 'x' if acc == 1 else '-x'
+            s += _wrf(sz, i, 'fp_fma64(%s,y,%s)' % (xa, d) if sz else '(f64)fp_fma32((f32)(%s),(f32)y,(f32)%s)' % (xa, d))
+        elif sel in FOP2: s += _wrf(sz, i, FOP2[sel])
+        elif sel == 8: s += 'f64 e=x-y; u64 u; memcpy(&u,&e,8); u&=~(1ull<<63); memcpy(&e,&u,8); ' + _wrf(sz, i, 'e')
+        else: s += _wrf(sz, i, _fhelper(FOP2_HELPER[sel], sz, 'x', 'y'))
+        s += '} '
+    return s + 'c->v[%d]=r; }' % rd
+
+
+def _addp(w):
+    """integer ADDP, vector (simd_3same op 0x17, U=0)"""
+    Q = (w >> 30) & 1; size = (w >> 22) & 3; rm = (w >> 16) & 31; rn = (w >> 5) & 31; rd = w & 31
+    if size == 3 and not Q: return None
+    T, CT = LANE[size]; n = (128 if Q else 64) // (8 << size); h = n // 2
+    s = '{ V128 a=c->v[%d], b=c->v[%d], r; r.d[0]=0; r.d[1]=0; ' % (rn, rm)
+    for i in range(n):
+        v = 'a' if i < h else 'b'; k = (i if i < h else i - h) * 2
+        s += 'r.%s[%d]=(%s)(%s.%s[%d]+%s.%s[%d]); ' % (T, i, CT, v, T, k, v, T, k + 1)
+    return s + 'c->v[%d]=r; }' % rd
+
+
+def _f2misc(w, scalar):
+    """simd_2misc fp part, except FCVTN/FCVTXN/FCVTL and FRECPX"""
+    Q = 0 if scalar else (w >> 30) & 1
+    U = (w >> 29) & 1; size = (w >> 22) & 3; op = (w >> 12) & 31; rn = (w >> 5) & 31; rd = w & 31
+    sz = size & 1; hi = size >> 1; fn = 1 if scalar else (2 if sz else (4 if Q else 2))
+    BT = 'd' if sz else 's'
+    if 0x0C <= op <= 0x0F and hi:
+        if sz and not Q and not scalar: return None
+        if op == 0x0F and scalar: return None
+        if op == 0x0E and U: return None
+        s = '{ V128 a=c->v[%d], r; r.d[0]=0; r.d[1]=0; ' % rn
+        for i in range(fn):
+            if op == 0x0F:
+                m = ('0x8000000000000000ull' if sz else '0x80000000u') if U else ('0x7FFFFFFFFFFFFFFFull' if sz else '0x7FFFFFFFu')
+                s += 'r.%s[%d]=a.%s[%d]%s%s; ' % (BT, i, BT, i, '^' if U else '&', m)
+            else:
+                k = (1 if U else 2) if op == 0x0C else ((5 if U else 0) if op == 0x0D else 6)
+                s += '{ f64 x=%s, y=0.0; %s} ' % (_rdf('a', sz, i), _mask(sz, i, FCMP[k]))
+        return s + 'c->v[%d]=r; }' % rd
+    if op < 0x16: return None
+    if op == 0x16 and not hi: return None
+    if op == 0x17 and not hi and not U: return None
+    if sz and not Q and not scalar: return None
+    k = (U << 6) | (hi << 5) | op
+    s = '{ V128 a=c->v[%d], r; r.d[0]=0; r.d[1]=0; ' % rn
+    for i in range(fn):
+        x = _rdf('a', sz, i); bits = 'a.%s[%d]' % (BT, i)
+        if k in (0x18, 0x38, 0x19, 0x39, 0x58, 0x59, 0x79):
+            mode = {0x18: '0', 0x38: '1', 0x19: '2', 0x39: '3', 0x58: '4'}.get(k, 'FPRM')
+            s += _wrf(sz, i, 'fp_round(%s,%s)' % (x, mode))
+        elif k in (0x1A, 0x3A, 0x1B, 0x3B, 0x1C, 0x5A, 0x7A, 0x5B, 0x7B, 0x5C):
+            rmode = 4 if (k & 0x1F) == 0x1C else ((1 if hi else 0) if (k & 0x1F) == 0x1A else (3 if hi else 2))
+            if sz: e = 'fcvt_u64(%s,%d)' % (x, rmode) if U else '(u64)fcvt_s64(%s,%d)' % (x, rmode)
+            else: e = 'fcvt_u32(%s,%d)' % (x, rmode) if U else '(u32)fcvt_s32(%s,%d)' % (x, rmode)
+            s += 'r.%s[%d]=%s; ' % (BT, i, e)
+        elif k == 0x1D: s += _wrf(sz, i, '(f64)(i64)%s' % bits if sz else '(f64)(f32)(i32)%s' % bits)
+        elif k == 0x5D: s += _wrf(sz, i, '(f64)%s' % bits if sz else '(f64)(f32)%s' % bits)
+        elif k == 0x3D: s += _wrf(sz, i, 'fp_recpe64(%s)' % x if sz else '(f64)fp_recpe32((f32)%s)' % x)
+        elif k == 0x7D: s += _wrf(sz, i, 'fp_rsqrte64(%s)' % x if sz else '(f64)fp_rsqrte32((f32)%s)' % x)
+        elif k == 0x7F: s += _wrf(sz, i, 'fp_sqrt64(%s)' % x if sz else '(f64)fp_sqrt32((f32)%s)' % x)
+        elif k in (0x3C, 0x7C) and not sz: s += 'r.s[%d]=%s(%s); ' % (i, 'urecpe32' if k == 0x3C else 'ursqrte32', bits)
+        else: return None
+    return s + 'c->v[%d]=r; }' % rd
+
+
+def _felem_mulx(w, scalar):
+    """FMULX by element (simd_elem, U=1 op 9); the U=0 forms are in fast_simd"""
+    Q = 0 if scalar else (w >> 30) & 1
+    U = (w >> 29) & 1; size = (w >> 22) & 3; L = (w >> 21) & 1; Mb = (w >> 20) & 1; rm = (w >> 16) & 15
+    op = (w >> 12) & 15; H = (w >> 11) & 1; rn = (w >> 5) & 31; rd = w & 31
+    if not U or op != 9 or size < 2: return None
+    sz = size & 1; idx = H if sz else (H << 1) | L; m = (Mb << 4) | rm
+    if sz and L: return None
+    if sz and not Q and not scalar: return None
+    n = 1 if scalar else (2 if sz else (4 if Q else 2))
+    s = '{ V128 a=c->v[%d], r; r.d[0]=0; r.d[1]=0; f64 y=%s; ' % (rn, _rdf('c->v[%d]' % m, sz, idx))
+    for i in range(n):
+        s += '{ f64 x=%s; %s} ' % (_rdf('a', sz, i), _wrf(sz, i, _fhelper('fp_mulx', sz, 'x', 'y')))
+    return s + 'c->v[%d]=r; }' % rd
+
+
+def _perm(w):
+    """UZP1/2, TRN1/2, ZIP1/2 (simd_perm)"""
+    Q = (w >> 30) & 1; size = (w >> 22) & 3; rm = (w >> 16) & 31; op = (w >> 12) & 7; rn = (w >> 5) & 31; rd = w & 31
+    if size == 3 and not Q: return None
+    if not op & 3: return None
+    T = LANE[size][0]; n = (128 if Q else 64) // (8 << size); h = n // 2; part = (op >> 2) & 1
+    s = '{ V128 a=c->v[%d], b=c->v[%d], r; r.d[0]=0; r.d[1]=0; ' % (rn, rm)
+    for i in range(n):
+        if op & 3 == 1:
+            k = 2 * i + part; v, k = ('a', k) if k < n else ('b', k - n)
+        elif op & 3 == 2:
+            k = i // 2 * 2 + part; v = 'b' if i & 1 else 'a'
+        else:
+            k = part * h + i // 2; v = 'b' if i & 1 else 'a'
+        s += 'r.%s[%d]=%s.%s[%d]; ' % (T, i, v, T, k)
+    return s + 'c->v[%d]=r; }' % rd
+
+
+def _ext(w):
+    Q = (w >> 30) & 1; rm = (w >> 16) & 31; imm4 = (w >> 11) & 15; rn = (w >> 5) & 31; rd = w & 31
+    if not Q and imm4 & 8: return None
+    return ('{ u8 t[32]; memcpy(t,&c->v[%d],16); memcpy(t+%d,&c->v[%d],16); V128 r; memset(&r,0,16); memcpy(&r,t+%d,%d); c->v[%d]=r; }'
+            % (rn, 16 if Q else 8, rm, imm4, 16 if Q else 8, rd))
+
+
+def _dup_s(w):
+    imm5 = (w >> 16) & 31; rn = (w >> 5) & 31; rd = w & 31
+    if not imm5 & 15: return None
+    size = (imm5 & -imm5).bit_length() - 1
+    T, CT = LANE[size]
+    return '{ %s e=c->v[%d].%s[%d]; c->v[%d].d[0]=0; c->v[%d].d[1]=0; c->v[%d].%s[0]=e; }' % (CT, rn, T, imm5 >> (size + 1), rd, rd, rd, T)
+
+
+def v_expand_imm(op, cmode, imm8):
+    """AdvSIMDExpandImm, same as v_expand_imm() in cpu_helpers.c"""
+    i = imm8; r = 0; c = cmode >> 1
+    if c == 0: r = i | (i << 32)
+    elif c == 1: r = (i << 8) | (i << 40)
+    elif c == 2: r = (i << 16) | (i << 48)
+    elif c == 3: r = (i << 24) | (i << 56)
+    elif c == 4: r = i | (i << 16); r |= r << 32
+    elif c == 5: r = (i << 8) | (i << 24); r |= r << 32
+    elif c == 6:
+        r = ((i << 8) | 0xFF) if not cmode & 1 else ((i << 16) | 0xFFFF); r |= r << 32
+    else:
+        if not cmode & 1 and not op:
+            for k in range(8): r |= i << (k * 8)
+        elif not cmode & 1 and op:
+            for k in range(8):
+                if (i >> k) & 1: r |= 0xFF << (k * 8)
+        elif cmode & 1 and not op:
+            b = ((i & 0x80) << 24) | (0x3E000000 if i & 0x40 else 0x40000000) | ((i & 0x3F) << 19); r = b | (b << 32)
+        else:
+            r = ((i & 0x80) << 56) | (0x3FC0000000000000 if i & 0x40 else 0x4000000000000000) | ((i & 0x3F) << 48)
+    return r & 0xFFFFFFFFFFFFFFFF
+
+
+def _modimm(w):
+    """MOVI/MVNI/ORR/BIC/FMOV vector immediate (simd_modimm)"""
+    Q = (w >> 30) & 1; op = (w >> 29) & 1; cmode = (w >> 12) & 15; rd = w & 31; o2 = (w >> 11) & 1
+    imm8 = (((w >> 16) & 7) << 5) | ((w >> 5) & 31)
+    if o2: return None
+    if cmode == 15 and op and not Q: return None
+    imm = v_expand_imm(op, cmode, imm8)
+    if cmode < 12 and cmode & 1:
+        if not op: return 'c->v[%d].d[0]|=%s; c->v[%d].d[1]=%s;' % (rd, lit(imm), rd, 'c->v[%d].d[1]|%s' % (rd, lit(imm)) if Q else '0')
+        nimm = lit(~imm)
+        return 'c->v[%d].d[0]&=%s; c->v[%d].d[1]=%s;' % (rd, nimm, rd, 'c->v[%d].d[1]&%s' % (rd, nimm) if Q else '0')
+    if op and cmode != 14 and cmode != 15: imm = ~imm
+    return 'c->v[%d].d[0]=%s; c->v[%d].d[1]=%s;' % (rd, lit(imm), rd, lit(imm) if Q else '0')
+
+
+def fast_simd2(g):
+    """Second inline tier (static mode only). None: the word stays a swr_simd call."""
+    if not SIMD_INLINE2: return None
+    w = g.w; r = simd_route(w)
+    if r in ('3same', '3same_s'):
+        op = (w >> 11) & 31
+        if op >= 0x18: return _f3same(w, r == '3same_s')
+        if op == 0x17 and r == '3same' and not (w >> 29) & 1: return _addp(w)
+        return None
+    if r in ('2misc', '2misc_s'): return _f2misc(w, r == '2misc_s')
+    if r in ('elem', 'elem_s'): return _felem_mulx(w, r == 'elem_s')
+    if r == 'perm': return _perm(w)
+    if r == 'ext': return _ext(w)
+    if r == 'dup_s': return _dup_s(w)
+    if r == 'modimm': return _modimm(w)
+    return None
+
+
+def fast_ld1_single(g):
+    """LD1-LD4/ST1-ST4 single lane, with post-index (simd_ldst); not LDnR"""
+    if not SIMD_INLINE2: return None
+    w = g.w
+    if (w & 0xBF000000) != 0x0D000000: return None
+    Q = (w >> 30) & 1; L = (w >> 22) & 1; post = (w >> 23) & 1; rm = (w >> 16) & 31; rn = (w >> 5) & 31; rt = w & 31
+    R = (w >> 21) & 1; op = (w >> 13) & 7; S = (w >> 12) & 1; size = (w >> 10) & 3
+    sel = (((op & 1) << 1) | R) + 1; sc = op >> 1
+    if sc == 3: return None
+    if sc == 0: esz = 0; idx = (Q << 3) | (S << 2) | size
+    elif sc == 1:
+        if size & 1: return None
+        esz = 1; idx = (Q << 2) | (S << 1) | (size >> 1)
+    else:
+        if size & 2: return None
+        if size & 1:
+            if S: return None
+            esz = 3; idx = Q
+        else: esz = 2; idx = (Q << 1) | S
+    T = LANE[esz][0]; by = 1 << esz
+    s = '{ u64 a0=c->x[%d], a=a0; ' % rn
+    for k in range(sel):
+        t = (rt + k) & 31
+        if L: s += 'c->v[%d].%s[%d]=%s(a); ' % (t, T, idx, RD[esz])
+        else: s += '%s(a,c->v[%d].%s[%d]); ' % (RD[esz].replace('RD', 'WR'), t, T, idx)
+        s += 'a+=%d; ' % by
+    if post: s += 'c->x[%d]=%s; ' % (rn, 'a' if rm == 31 else 'a0+c->x[%d]' % rm)
+    return s + '}'
+
+
 @ins('SIMD_DP', '0 x x 0 111 x xxxxxxxxxxxxxxxxxxxxxxxx')
 def _(g):
     if g.static:
-        f = fast_simd(g)
+        f = fast_simd(g) or fast_simd2(g)
         if f: return f
     return simd_fallback(g)
 
 
 @ins('SIMD_DP2', '0 1 x 1 111 x xxxxxxxxxxxxxxxxxxxxxxxx')
 def _(g):
+    if g.static and SIMD_INLINE2:     # scalar forms; fast_simd's scalar by-element template is only reached here
+        f = fast_simd(g) or fast_simd2(g)
+        if f: return f
     return simd_fallback(g)
 
 

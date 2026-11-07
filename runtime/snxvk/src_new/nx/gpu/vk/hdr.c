@@ -18,6 +18,7 @@ extern int backend_hdr_peak_nits(void);                  /* the display's peak, 
 int vk_hdr_wanted(void) { return g_opt_hdr && g_vk_hdr_ext; }
 extern int g_opt_show_fps;                               /* FPS counter (main.c fps_overlay_rects) */
 extern int fps_overlay_rects(int W, int H, int (*r)[5], int max);
+extern int fps_overlay_rows(void);                       /* 2 with frame generation: rendered and shown */
 extern volatile int g_skip_prompt;   /* SWR: "Hold (-) to skip" (main.c skip_hold_filter) */
 extern volatile float g_skip_hold;
 extern u64 plat_ns(void);
@@ -157,6 +158,11 @@ void vk_hdr_swapchain_gone(void) {
     }
 }
 
+void vk_hdr_mid_target(VkImageView* view, VkFormat* format) {
+    *view = g_mid_view;
+    *format = g_mid_fmt;
+}
+
 /* the SDR image the frame is letterboxed into while the swapchain is HDR: the swapchain's size, sRGB when the frame
    is (a blit between sRGB formats keeps the bytes, as the SDR path's blit to an sRGB swapchain does). NULL = can't */
 VkImage vk_hdr_mid(int srgb) {
@@ -288,7 +294,7 @@ void vk_hdr_resolve(VkCommandBuffer cb, VkImage sc) {
         g_ovl_alpha += (want - g_ovl_alpha) * step; if (g_ovl_alpha < 0.01f && !g_skip_prompt) g_ovl_alpha = 0;
         if (g_ovl_state == 2 && g_ovl_tw > 0 && g_ovl_alpha > 0) {
             float k = (float)g_vk.sc_extent.height / 1080.0f; if (k < 0.5f) k = 0.5f;
-            float x = 48 * k, y = (g_opt_show_fps ? 96 : 44) * k;
+            float x = 48 * k, y = (fps_overlay_rows() == 2 ? 148 : g_opt_show_fps ? 96 : 44) * k;
             pc.ox = x - 2 * k; pc.oy = y - 4 * k; pc.ow = g_ovl_w * k; pc.oh = g_ovl_h * k; pc.oa = g_ovl_alpha;
             pc.hold = g_skip_hold; pc.bx = x; pc.by = y + 42 * k; pc.bw = g_ovl_tw * k; pc.bh = 4 * k;
         }
@@ -313,8 +319,8 @@ void vk_hdr_resolve(VkCommandBuffer cb, VkImage sc) {
     rec_CmdPushConstants(cb, g_layout, VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof pc, &pc);
     rec_CmdDraw(cb, 3, 1, 0, 0);
     { /* SWR: the FPS counter as cleared rectangles over the picture, in the swapchain's encoding */
-        int r[64][5];
-        int n = fps_overlay_rects((int)g_vk.sc_extent.width, (int)g_vk.sc_extent.height, r, 64);
+        int r[96][5];
+        int n = fps_overlay_rects((int)g_vk.sc_extent.width, (int)g_vk.sc_extent.height, r, 96);
         for (int i = 0; i < n; i++) {
             VkClearAttachment ca = {VK_IMAGE_ASPECT_COLOR_BIT, 0, {{{0, 0, 0, 1}}}};
             if (r[i][4]) {

@@ -34,6 +34,10 @@ long long file_size(const std::string& p) {
     WIN32_FILE_ATTRIBUTE_DATA d; if (!GetFileAttributesExW(wide(p).c_str(), GetFileExInfoStandard, &d)) return -1;
     return ((long long)d.nFileSizeHigh << 32) | d.nFileSizeLow;
 }
+double disk_free_gb(const std::string& dir) {
+    ULARGE_INTEGER avail; if (!GetDiskFreeSpaceExW(wide(dir).c_str(), &avail, nullptr, nullptr)) return -1;
+    return avail.QuadPart / 1073741824.0;
+}
 bool make_dirs(const std::string& p) { int r = SHCreateDirectoryExW(nullptr, wide(p).c_str(), nullptr); return r == ERROR_SUCCESS || r == ERROR_ALREADY_EXISTS || r == ERROR_FILE_EXISTS; }
 std::string read_text(const std::string& p) {
     FILE* f = _wfopen(wide(p).c_str(), L"rb"); if (!f) return {};
@@ -52,6 +56,8 @@ void Paths::init(const char* dir, const char* name) {
     for (auto& c : exedir) if (c == '/') c = '\\';
     exe = join(exedir, exename + ".exe"); ini = join(exedir, exename + ".ini"); data = join(exedir, exename + "_data");
     code = join(exedir, exename + "_code.dll"); build = join(exedir, exename + "_build"); recompiler = join(exedir, "recompiler");
+    // a build from source: SWR_RECOMPILER points at the repository (as on Linux), the release has recompiler\ beside the EXE
+    if (const wchar_t* r = _wgetenv(L"SWR_RECOMPILER")) if (*r) recompiler = utf8(r);
     setup_ok = join(data, "setup.ok");
     wchar_t* ad = nullptr; if (SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &ad) == S_OK) { appdata = join(utf8(ad), "MetroidPrime4Recomp"); std::string old = join(utf8(ad), "MetroidBeyondRecomp"); CoTaskMemFree(ad);
         // earlier builds used MetroidBeyondRecomp: moved once
@@ -167,7 +173,11 @@ GameCheck check_installed() {
 static CRITICAL_SECTION g_cs; static bool g_cs_init;
 void setup_lock() { if (!g_cs_init) { InitializeCriticalSection(&g_cs); g_cs_init = true; } EnterCriticalSection(&g_cs); }
 void setup_unlock() { LeaveCriticalSection(&g_cs); }
-std::string recompiler_python() { return join(P.recompiler, "python\\python.exe"); }
+// the release's bundled Python, else (a build from source) SWR_PYTHON, else python.exe on PATH
+std::string recompiler_python() {
+    std::string p = join(P.recompiler, "python\\python.exe"); if (file_exists(p)) return p;
+    if (const wchar_t* e = _wgetenv(L"SWR_PYTHON")) if (*e) return utf8(e);
+    wchar_t b[MAX_PATH]; return SearchPathW(nullptr, L"python.exe", nullptr, MAX_PATH, b, nullptr) ? utf8(b) : p; }
 
 struct ReaderArg { SetupJob* j; HANDLE rd; HANDLE proc; HANDLE job; };
 static DWORD WINAPI reader(void* p) {
@@ -201,6 +211,7 @@ static DWORD WINAPI reader(void* p) {
 
 bool setup_start(SetupJob& j) {
     std::string py = recompiler_python(), script = join(P.recompiler, "beyond_setup.py");
+    if (!file_exists(script)) script = join(P.recompiler, "beyond\\beyond_setup.py");   // SWR_RECOMPILER pointing at the repository
     if (!file_exists(py) || !file_exists(script)) { j.failed = true; j.error = "The recompiler is missing: expected " + P.recompiler + " (python\\python.exe and beyond_setup.py). Re-extract the release."; return false; }
     // command-line quoting: a backslash before the closing quote must be doubled ("C:\dir\\")
     auto q = [](const std::string& v) { std::wstring w = wide(v); size_t n = 0; while (n < w.size() && w[w.size() - 1 - n] == L'\\') n++; w.append(n, L'\\'); return L"\"" + w + L"\""; };

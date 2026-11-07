@@ -17,7 +17,10 @@
 #include "nx/runtime/options.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/gpu/vk/vk.h"
+#include "nx/gpu/vk/descriptors.h"
 #include "nx/runtime/platform/plat.h"
+#include "nx/runtime/platform/tracy.h"
+VkResult vk_sc_present(VkQueue q, const VkPresentInfoKHR* pi); /* SWR: fsr_fg.c, dlss_stub.c */
 
 typedef void (*RecFn)(const void* args);
 typedef struct {
@@ -25,7 +28,11 @@ typedef struct {
     u64 size; /* of the packet, header included, a multiple of 16 */
 } RecHdr;
 
-#define REC_CAP     (16ull << 20)
+/* The ring holds about a frame of one game's commands (3.8 MB a frame in its underground scene). At 16 MB every packet
+   went to memory last written four frames before, long out of the caches, and the stream through the shared cache
+   likely pushed out what the GPU thread's draws look up: at 4 MB that thread's load misses dropped a tenth and its
+   frames took 5% fewer cycles. The producer waits for room only when the recording thread is a whole frame behind */
+#define REC_CAP     (4ull << 20)
 #define REC_PUBLISH (32ull << 10)
 
 static u8* g_ring;
@@ -43,8 +50,10 @@ static PCond g_cv;
 static void rec_thread(void* arg) {
     u64 tail = 0;
     (void)arg;
+    SNX_THREAD_NAME("Vulkan recorder");
     (void)g_pad0;
     (void)g_pad1;
+    SNX_THREAD_NAME("vk record");
     for (;;) {
         u64 head = __atomic_load_n(&g_head, __ATOMIC_ACQUIRE);
         /* nothing more yet: sleep until the producer publishes (REC_PUBLISH). It spun 4000 pauses first, which with
@@ -57,11 +66,16 @@ static void rec_thread(void* arg) {
             __atomic_store_n(&g_sleep, 0, __ATOMIC_RELAXED);
             pm_unlock(&g_m);
         }
+        [[maybe_unused]] u64 records = 0; /* the zone's value; only the profiler reads it */
+        SNX_ZONE(z_rec, "vk record");
         while (tail != head) {
             const RecHdr* h = (const RecHdr*)(g_ring + (tail & (REC_CAP - 1)));
             if (h->fn) h->fn(h + 1);
             tail += h->size;
+            records++;
         }
+        SNX_ZONE_VALUE(z_rec, records);
+        SNX_ZONE_END(z_rec);
         __atomic_store_n(&g_tail, tail, __ATOMIC_RELEASE);
     }
 }
@@ -154,6 +168,14 @@ void vk_rec_queue(VkQueue q) {
     if (q == g_vk.gfx) vk_rec_sync();
 }
 
+/* The graphics and the compute queue's locks (vk_queue_lock): this thread submits and presents on the graphics queue
+   while the GPU thread may bind an image's pieces on it (memory.c). The compute queue's is the graphics queue's when
+   they are one queue */
+static PMutex g_gfx_qlock = PMUTEX_INIT, g_compute_qlock = PMUTEX_INIT;
+static PMutex* queue_mutex(VkQueue q) { return q == g_vk.gfx ? &g_gfx_qlock : &g_compute_qlock; }
+void vk_queue_lock(VkQueue q) { pm_lock(queue_mutex(q)); }
+void vk_queue_unlock(VkQueue q) { pm_unlock(queue_mutex(q)); }
+
 /* ------------------------------------------------------------ beginning and submitting */
 static void begin_run(const void* p) {
     VkCommandBufferBeginInfo bi = {.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -187,7 +209,10 @@ static void submit_run(const void* p) {
                         .pCommandBufferInfos = &c,
                         .signalSemaphoreInfoCount = x->ns,
                         .pSignalSemaphoreInfos = x->s};
+    vk_wait_foreground();
+    vk_queue_lock(g_vk.gfx);
     VkResult r = vkQueueSubmit2(g_vk.gfx, 1, &si, VK_NULL_HANDLE);
+    vk_queue_unlock(g_vk.gfx);
     if (r == VK_ERROR_DEVICE_LOST) fatal("vulkan: the GPU device was lost (driver reset or crash)");
     VK_OK(r);
     /* a timeline of FFmpeg's never reaching its value would hang its decoder for good */
@@ -220,6 +245,11 @@ typedef struct {
     VkSwapchainKHR sc;
     VkSemaphore wait;
     u32 idx;
+    u64 id;     /* display.c's, 0 none */
+    u64 target; /* not shown before then (with VK_CLOCK_WAIT2, in the time domain domain), 0 none */
+    u64 domain; /* the time domain's id */
+    u32 stage;  /* the present stage the domain is local to, 0 none */
+    int clock;  /* the swapchain's VkClock: how the id and the time are given */
 } Present;
 static VkResult g_present_result; /* atomic: the last present's result that wasn't VK_SUCCESS, until it is taken */
 static VkResult present_run(const Present* x) {
@@ -229,14 +259,39 @@ static VkResult present_run(const Present* x) {
                            .swapchainCount = 1,
                            .pSwapchains = &x->sc,
                            .pImageIndices = &x->idx};
-    return vkQueuePresentKHR(g_vk.gfx, &pi);
+    VkPresentIdKHR pid = {.sType = VK_STRUCTURE_TYPE_PRESENT_ID_KHR, .swapchainCount = 1, .pPresentIds = &x->id};
+    VkPresentId2KHR pid2 = {.sType = VK_STRUCTURE_TYPE_PRESENT_ID_2_KHR, .swapchainCount = 1, .pPresentIds = &x->id};
+    VkPresentTimingInfoEXT ti = {.sType = VK_STRUCTURE_TYPE_PRESENT_TIMING_INFO_EXT,
+                                 .targetTime = x->target,
+                                 .timeDomainId = x->domain,
+                                 .targetTimeDomainPresentStage = x->stage};
+    VkPresentTimingsInfoEXT tis = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_TIMINGS_INFO_EXT, .swapchainCount = 1, .pTimingInfos = &ti};
+    VkPresentTimeGOOGLE gt = {.presentID = (u32)x->id, .desiredPresentTime = x->target};
+    VkPresentTimesInfoGOOGLE gtis = {
+        .sType = VK_STRUCTURE_TYPE_PRESENT_TIMES_INFO_GOOGLE, .swapchainCount = 1, .pTimes = &gt};
+    if (x->id && x->clock == VK_CLOCK_WAIT2) {
+        pi.pNext = &pid2;
+        if (x->target) pid2.pNext = &tis;
+    } else if (x->id && x->clock == VK_CLOCK_GOOGLE)
+        pi.pNext = &gtis;
+    else if (x->id)
+        pi.pNext = &pid;
+    SNX_ZONE(z_queue_present, "vkQueuePresentKHR");
+    pm_lock(&g_vk.sc_lock); /* the swapchain, which the GPU thread acquires from and display.c waits on meanwhile */
+    vk_queue_lock(g_vk.gfx);
+    VkResult r = vk_sc_present(g_vk.gfx, &pi); /* SWR: AMD's frame generation swapchain or the plain one (fsr_fg.c) */
+    vk_queue_unlock(g_vk.gfx);
+    pm_unlock(&g_vk.sc_lock);
+    vk_display_made(x->id, r);
+    return r;
 }
 static void present_queued(const void* p) {
     VkResult r = present_run(p);
     if (r != VK_SUCCESS) __atomic_store_n(&g_present_result, r, __ATOMIC_RELEASE);
 }
-VkResult vk_rec_present(VkSwapchainKHR sc, u32 idx, VkSemaphore wait) {
-    Present x = {sc, wait, idx};
+VkResult vk_rec_present(VkSwapchainKHR sc, u32 idx, VkSemaphore wait, u64 id, u64 target) {
+    Present x = {sc, wait, idx, id, g_vk.sc_hold ? target : 0, g_vk.sc_time_domain, g_vk.sc_time_stage, g_vk.sc_clock};
     if (g_rec <= 0) return present_run(&x);
     *(Present*)rec_push(present_queued, sizeof x) = x;
     publish();
@@ -289,9 +344,11 @@ VkResult vk_rec_present_result(void) {
 
 /* A graphics pipeline may be a stand-in for one a worker is still making (vk_pipeline_get_deferred): it is waited for
    here, at its bind. One that couldn't be made binds nothing, and the draws after it until the next graphics bind are
-   dropped, as the GPU thread drops a draw without its pipeline (the recording thread's own flag) */
+   dropped, as the GPU thread drops a draw without its pipeline (the recording thread's own flag: 1). With
+   async_pipelines one still being made isn't waited for: its draws are dropped the same way (2) until a later frame
+   binds it made. A new shader's compile, 60 to 400 ms on one driver, stalled the frame it first appeared in */
 static int g_rec_unbound;
-static u64 g_rec_dropped;
+static u64 g_rec_dropped, g_rec_skipped;
 typedef struct {
     VkCommandBuffer cb;
     VkPipelineBindPoint bp;
@@ -299,8 +356,10 @@ typedef struct {
 } BindPipelineArgs;
 static void bind_pipeline_run(const void* p) {
     const BindPipelineArgs* x = p;
-    VkPipeline pipe = vk_pipeline_resolve(x->p);
-    if (x->bp == VK_PIPELINE_BIND_POINT_GRAPHICS) g_rec_unbound = !pipe;
+    int graphics = x->bp == VK_PIPELINE_BIND_POINT_GRAPHICS, pending = 0;
+    VkPipeline pipe =
+        graphics && g_settings.async_pipelines ? vk_pipeline_now(x->p, &pending) : vk_pipeline_resolve(x->p);
+    if (graphics) g_rec_unbound = pipe ? 0 : pending ? 2 : 1;
     if (pipe) vkCmdBindPipeline(x->cb, x->bp, pipe);
 }
 void rec_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline p) {
@@ -315,7 +374,12 @@ void rec_CmdBindPipeline(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPipeline 
 }
 static int rec_drop_draw(void) {
     if (!g_rec_unbound) return 0;
-    if (!g_rec_dropped++) WARN("vulkan: a pipeline couldn't be made: its draws are dropped\n");
+    if (g_rec_unbound == 2) {
+        if (g_rec_skipped++ % 1000 == 0)
+            LOG("vulkan: %llu draws skipped while their pipelines were made (async_pipelines)\n",
+                (unsigned long long)g_rec_skipped);
+    } else if (!g_rec_dropped++)
+        WARN("vulkan: a pipeline couldn't be made: its draws are dropped\n");
     return 1;
 }
 typedef struct {
@@ -355,8 +419,41 @@ void rec_CmdDrawIndexed(VkCommandBuffer cb, u32 indices, u32 instances, u32 firs
     *x = (DrawIndexedArgs){cb, indices, instances, first_index, vertex_offset, first_instance};
     rec_commit();
 }
+/* the indirect draws: kind bit 0 indexed, bit 1 limited by the count at count_buf */
+typedef struct {
+    VkCommandBuffer cb;
+    VkBuffer buf, count_buf;
+    VkDeviceSize off, count_off;
+    u32 kind, max, stride;
+} DrawIndirectArgs;
+static void draw_indirect_now(const DrawIndirectArgs* x) {
+    switch (x->kind) {
+        case 0: vkCmdDrawIndirect(x->cb, x->buf, x->off, x->max, x->stride); break;
+        case 1: vkCmdDrawIndexedIndirect(x->cb, x->buf, x->off, x->max, x->stride); break;
+        case 2: vkCmdDrawIndirectCount(x->cb, x->buf, x->off, x->count_buf, x->count_off, x->max, x->stride); break;
+        default:
+            vkCmdDrawIndexedIndirectCount(x->cb, x->buf, x->off, x->count_buf, x->count_off, x->max, x->stride);
+            break;
+    }
+}
+static void draw_indirect_run(const void* p) {
+    if (!rec_drop_draw()) draw_indirect_now((const DrawIndirectArgs*)p);
+}
+void rec_CmdDrawIndirect(VkCommandBuffer cb, int indexed, VkBuffer buf, VkDeviceSize off, VkBuffer count_buf,
+                         VkDeviceSize count_off, u32 max, u32 stride) {
+    DrawIndirectArgs a = {cb, buf, count_buf, off, count_off, (indexed ? 1u : 0u) | (count_buf ? 2u : 0u), max,
+                          stride};
+    if (!rec_on(cb)) {
+        draw_indirect_now(&a);
+        return;
+    }
+    DrawIndirectArgs* x = rec_push(draw_indirect_run, sizeof *x);
+    *x = a;
+    rec_commit();
+}
 REC3(CmdBindIndexBuffer, VkBuffer, VkDeviceSize, VkIndexType)
 REC3(CmdDispatch, u32, u32, u32)
+REC2(CmdDispatchIndirect, VkBuffer, VkDeviceSize)
 REC0(CmdEndRendering)
 REC1(CmdSetCullMode, VkCullModeFlags)
 REC1(CmdSetFrontFace, VkFrontFace)
@@ -501,6 +598,52 @@ void rec_CmdBindDescriptorSets(VkCommandBuffer cb, VkPipelineBindPoint bp, VkPip
 
 typedef struct {
     VkCommandBuffer cb;
+    VkDeviceAddress address;
+} DescriptorBufferArgs;
+static void descriptor_buffer_run(const void* p) {
+    const DescriptorBufferArgs* x = p;
+    VkDescriptorBufferBindingInfoEXT info = {.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT,
+        .address = x->address,
+        .usage = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT | VK_BUFFER_USAGE_SAMPLER_DESCRIPTOR_BUFFER_BIT_EXT};
+    vkCmdBindDescriptorBuffersEXT(x->cb, 1, &info);
+}
+void rec_CmdBindDescriptorBuffersEXT(VkCommandBuffer cb, VkDeviceAddress address) {
+    DescriptorBufferArgs args = {cb, address};
+    if (!rec_on(cb)) {
+        descriptor_buffer_run(&args);
+        return;
+    }
+    DescriptorBufferArgs* x = rec_push(descriptor_buffer_run, sizeof *x);
+    *x = args;
+    rec_commit();
+}
+typedef struct {
+    VkCommandBuffer cb;
+    VkPipelineLayout layout;
+    u32 first, count;
+    VkDeviceSize offsets[5];
+} DescriptorOffsetsArgs;
+static void descriptor_offsets_run(const void* p) {
+    const DescriptorOffsetsArgs* x = p;
+    const u32 indices[5] = {0};
+    vkCmdSetDescriptorBufferOffsetsEXT(x->cb, VK_PIPELINE_BIND_POINT_GRAPHICS, x->layout,
+                                        x->first, x->count, indices, x->offsets);
+}
+void rec_CmdSetDescriptorBufferOffsetsEXT(VkCommandBuffer cb, VkPipelineLayout layout, u32 first, u32 count,
+                                         const VkDeviceSize* offsets) {
+    DescriptorOffsetsArgs args = {.cb = cb, .layout = layout, .first = first, .count = count};
+    for (u32 i = 0; i < count && i < 5; i++) args.offsets[i] = offsets[i];
+    if (!rec_on(cb)) {
+        descriptor_offsets_run(&args);
+        return;
+    }
+    DescriptorOffsetsArgs* x = rec_push(descriptor_offsets_run, sizeof *x);
+    *x = args;
+    rec_commit();
+}
+
+typedef struct {
+    VkCommandBuffer cb;
     u32 first, n;
     int sizes, strides;
 } VbArgs;
@@ -531,6 +674,31 @@ void rec_CmdBindVertexBuffers2(VkCommandBuffer cb, u32 first, u32 n, const VkBuf
 }
 void rec_CmdBindVertexBuffers(VkCommandBuffer cb, u32 first, u32 n, const VkBuffer* bufs, const VkDeviceSize* offs) {
     rec_CmdBindVertexBuffers2(cb, first, n, bufs, offs, NULL, NULL);
+}
+
+/* a draw's vertex layout as dynamic state: the bindings, then the attributes */
+typedef struct {
+    VkCommandBuffer cb;
+    u32 nb, na;
+} VertexInputArgs;
+static void vertex_input_run(const void* p) {
+    const VertexInputArgs* x = p;
+    const u8* q = (const u8*)p + REC_AL(sizeof *x);
+    vkCmdSetVertexInputEXT(x->cb, x->nb, (const void*)q, x->na,
+                           (const void*)(q + REC_AL(x->nb * sizeof(VkVertexInputBindingDescription2EXT))));
+}
+void rec_CmdSetVertexInputEXT(VkCommandBuffer cb, u32 nb, const VkVertexInputBindingDescription2EXT* b, u32 na,
+                              const VkVertexInputAttributeDescription2EXT* a) {
+    if (!rec_on(cb)) {
+        vkCmdSetVertexInputEXT(cb, nb, b, na, a);
+        return;
+    }
+    u64 h = REC_AL(sizeof(VertexInputArgs)), bn = REC_AL(nb * sizeof *b);
+    VertexInputArgs* x = rec_push(vertex_input_run, h + bn + na * sizeof *a);
+    *x = (VertexInputArgs){cb, nb, na};
+    if (nb) memcpy((u8*)x + h, b, nb * sizeof *b);
+    if (na) memcpy((u8*)x + h + bn, a, na * sizeof *a);
+    rec_commit();
 }
 
 /* transform feedback (VK_EXT_transform_feedback): the buffers with their offsets and sizes (bind), or the counter
@@ -650,7 +818,7 @@ typedef struct {
     VkImageLayout l1, l2;
     u32 n;
     u32 e; /* a filter */
-    u64 v[3]; /* a clear value */
+    VkClearValue v; /* a clear value */
 } XferArgs;
 #define XFER_REGIONS(x) ((const void*)((const u8*)(x) + REC_AL(sizeof *(x))))
 static void copy_buffer_run(const void* p) {
@@ -665,6 +833,10 @@ static void blit_run(const void* p) {
     const XferArgs* x = p;
     vkCmdBlitImage(x->cb, (VkImage)x->h1, x->l1, (VkImage)x->h2, x->l2, x->n, XFER_REGIONS(x), (VkFilter)x->e);
 }
+static void resolve_run(const void* p) {
+    const XferArgs* x = p;
+    vkCmdResolveImage(x->cb, (VkImage)x->h1, x->l1, (VkImage)x->h2, x->l2, x->n, XFER_REGIONS(x));
+}
 static void buffer_to_image_run(const void* p) {
     const XferArgs* x = p;
     vkCmdCopyBufferToImage(x->cb, (VkBuffer)x->h1, (VkImage)x->h2, x->l2, x->n, XFER_REGIONS(x));
@@ -675,11 +847,11 @@ static void image_to_buffer_run(const void* p) {
 }
 static void clear_color_run(const void* p) {
     const XferArgs* x = p;
-    vkCmdClearColorImage(x->cb, (VkImage)x->h1, x->l1, (const VkClearColorValue*)x->v, x->n, XFER_REGIONS(x));
+    vkCmdClearColorImage(x->cb, (VkImage)x->h1, x->l1, &x->v.color, x->n, XFER_REGIONS(x));
 }
 static void clear_depth_run(const void* p) {
     const XferArgs* x = p;
-    vkCmdClearDepthStencilImage(x->cb, (VkImage)x->h1, x->l1, (const VkClearDepthStencilValue*)x->v, x->n,
+    vkCmdClearDepthStencilImage(x->cb, (VkImage)x->h1, x->l1, &x->v.depthStencil, x->n,
                                 XFER_REGIONS(x));
 }
 u64 g_rec_xfers, g_rec_barriers; /* copies and blits, and barriers, put in the frame's ring (gpuprof.c's gaps) */
@@ -732,6 +904,15 @@ void rec_CmdBlitImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage
     rec_xfer(blit_run, cb, (u64)src, sl, (u64)dst, dl, n, r, n * sizeof *r)->e = filter;
     rec_commit();
 }
+void rec_CmdResolveImage(VkCommandBuffer cb, VkImage src, VkImageLayout sl, VkImage dst, VkImageLayout dl, u32 n,
+                         const VkImageResolve* r) {
+    if (!rec_on(cb)) {
+        vkCmdResolveImage(cb, src, sl, dst, dl, n, r);
+        return;
+    }
+    rec_xfer(resolve_run, cb, (u64)src, sl, (u64)dst, dl, n, r, n * sizeof *r);
+    rec_commit();
+}
 void rec_CmdCopyBufferToImage(VkCommandBuffer cb, VkBuffer src, VkImage dst, VkImageLayout dl, u32 n,
                               const VkBufferImageCopy* r) {
     if (!rec_on(cb)) {
@@ -756,7 +937,7 @@ void rec_CmdClearColorImage(VkCommandBuffer cb, VkImage img, VkImageLayout l, co
         vkCmdClearColorImage(cb, img, l, c, n, r);
         return;
     }
-    memcpy(rec_xfer(clear_color_run, cb, (u64)img, l, 0, 0, n, r, n * sizeof *r)->v, c, sizeof *c);
+    rec_xfer(clear_color_run, cb, (u64)img, l, 0, 0, n, r, n * sizeof *r)->v.color = *c;
     rec_commit();
 }
 void rec_CmdClearDepthStencilImage(VkCommandBuffer cb, VkImage img, VkImageLayout l, const VkClearDepthStencilValue* c,
@@ -765,7 +946,7 @@ void rec_CmdClearDepthStencilImage(VkCommandBuffer cb, VkImage img, VkImageLayou
         vkCmdClearDepthStencilImage(cb, img, l, c, n, r);
         return;
     }
-    memcpy(rec_xfer(clear_depth_run, cb, (u64)img, l, 0, 0, n, r, n * sizeof *r)->v, c, sizeof *c);
+    rec_xfer(clear_depth_run, cb, (u64)img, l, 0, 0, n, r, n * sizeof *r)->v.depthStencil = *c;
     rec_commit();
 }
 

@@ -5,6 +5,7 @@
    and SD card mapped to normal folders. */
 #include "rt.h"
 #include <ctype.h>
+void snxvk_own_acquire(u64 a, u64 n);   /* snxvk_glue.c: GPU-held pages land before a file call touches them */
 
 #define FS_NOTFOUND RC(2,1)
 #define FS_EXISTS   RC(2,2)
@@ -267,7 +268,7 @@ static int romstorage(SvcObj* o, IpcCtx* c){
   switch(c->cmd){
     case 0: { u64 off=in64(c,0), sz=in64(c,8), a, bs; buf_out(c,0,&a,&bs); if(sz>bs) sz=bs;
       if(off>rtotal) return RC(2,6001); if(off+sz>rtotal) sz=rtotal-off;
-      romfs_read(off,GP(a),sz); return 0; }
+      snxvk_own_acquire(a,sz); romfs_read(off,GP(a),sz); return 0; }
     case 4: out64(c,rtotal); return 0;
     case 1: case 2: case 3: return RC(2,6300);
     case 5: { u8 z[0x40]; memset(z,0,sizeof z); outbytes(c,z,0x40); return 0; }
@@ -313,9 +314,9 @@ static int file_disp(SvcObj* o, IpcCtx* c){
   FileData* f=o->data;
   switch(c->cmd){
     case 0: { u64 off=in64(c,8), sz=in64(c,16), a, bs; buf_out(c,0,&a,&bs); if(sz>bs) sz=bs;
-      fseek(f->f,(long)off,SEEK_SET); u64 n=fread(GP(a),1,sz,f->f); out64(c,n); return 0; }
+      snxvk_own_acquire(a,sz); fseek(f->f,(long)off,SEEK_SET); u64 n=fread(GP(a),1,sz,f->f); out64(c,n); return 0; }
     case 1: { u64 off=in64(c,8), sz=in64(c,16), a, bs; buf_in(c,0,&a,&bs); if(sz>bs) sz=bs;
-      fseek(f->f,(long)off,SEEK_SET); fwrite(GP(a),1,sz,f->f); if(in32(c,0)&1) fflush(f->f); return 0; }
+      snxvk_own_acquire(a,sz); fseek(f->f,(long)off,SEEK_SET); fwrite(GP(a),1,sz,f->f); if(in32(c,0)&1) fflush(f->f); return 0; }
     case 2: fflush(f->f); return 0;
     case 3: { u64 n=in64(c,0); fflush(f->f); fseek(f->f,0,SEEK_END); u64 cur=(u64)ftell(f->f);
       if(n>cur){ u64 k=n-cur; static const u8 z[4096]; while(k){ u64 m=k>4096?4096:k; fwrite(z,1,m,f->f); k-=m; } fflush(f->f); }

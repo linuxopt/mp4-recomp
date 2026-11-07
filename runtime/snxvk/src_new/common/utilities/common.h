@@ -15,23 +15,56 @@ typedef struct {
     const char* build;
     const char* executable;
     const char* source; /* the checkout the build came from (snx_checkout), to build tools in; NULL without one */
+    const char* keys; /* optional prod.keys path supplied with --keys */
+    const char* title_keys; /* optional title.keys path supplied with --title-keys */
 } SnxPaths;
 
 void* snx_alloc(size_t size);
 void* snx_realloc(void* ptr, size_t size);
 char* snx_strdup(const char* s);
 char* snx_format(const char* fmt, ...);
+/* 1 when text ends with ending, ASCII letters of either case alike (a file's extension) */
+int snx_ends_with_nocase(const char* text, const char* ending);
+/* a shared library (a DLL on Windows, its UTF-8 path widened) loaded with its symbols bound now and kept to itself
+   (RTLD_NOW | RTLD_LOCAL); NULL with "cannot load PATH: reason" in error when it can't be */
+void* snx_library_open(const char* path, char* error, size_t error_size);
+/* a symbol of a library snx_library_open loaded, NULL when it has none of that name */
+void* snx_library_symbol(void* library, const char* name);
+void snx_library_close(void* library);
+/* a path's / turned into \ on Windows, the separator its system shows (C:\Users\...); nothing elsewhere */
+void snx_path_native(char* path);
+/* the room of a path made in a caller's buffer: Linux's PATH_MAX, past what Windows takes without its long paths */
+#define SNX_PATH_SIZE 4096
+/* fmt's path into out, of size bytes, its separators the system's (snx_path_native). 0; -1 when it does not fit,
+   said with snx_error, out empty */
+int snx_path_format(char* out, size_t size, const char* fmt, ...);
 /* says a line of error, "scarletnx: " and the line on stderr, or to the sink given to snx_error_sink. Returns 1 */
 int snx_error(const char* fmt, ...);
+/* an option given by the name an older version had, old (a literal), said once a run with its name now */
+void snx_option_renamed(const char* old, const char* now);
 /* where snx_error's lines go from now on instead of stderr (the runtime's log, which a game's process on Android has
    no other way to keep them in), NULL for stderr again. Set before the threads that say errors start */
 void snx_error_sink(void (*sink)(const char* line));
 /* the system's reason for the file or folder call that just failed, into out: strerror(errno), or on Windows the
-   text of GetLastError, which its calls set instead of errno */
+   text of GetLastError, which its calls set instead of errno (snx_windows_reason) */
 char* snx_os_error(char* out, size_t size);
+/* the reason Windows gives for an error code, the n UTF-16 units of text (FormatMessageW's, in the system's language),
+   into out as UTF-8 without the line break and full stop it ends in, the code after it: "<text> (Windows error
+   <code>)", or "Windows error <code>" for no text. A unit that is no character is U+FFFD; a short out keeps whole
+   characters of the text, and the code after them only whole */
+char* snx_windows_reason(const uint16_t* text, size_t n, unsigned long code, char* out, size_t size);
+/* a, then b, a separator between: one path in the system's separators (snx_path_native) */
 char* snx_path_join(const char* a, const char* b);
 char* snx_dirname(const char* path);
 char* snx_absolute(const char* path);
+/* the last part of a path, after its last '/' or '\\' (either, on any host: names from other systems' paths too) */
+const char* snx_path_leaf(const char* path);
+/* the full path of a game's folder: outdir/title when outdir is given, else title's folder under recompiled/ in repo
+   or, without one, in the data folder beside the program argv0 names (snx_data_dir); made first when make is set.
+   NULL when it cannot be resolved (or made), the reason in errno (snx_os_error). The caller's to free */
+char* snx_game_folder(const char* repo, const char* outdir, const char* argv0, const char* title, int make);
+/* a run length in seconds from text ("90", "2.5"): above zero, at most 1e9, nothing after the number. 0 otherwise */
+int snx_parse_seconds(const char* text, double* seconds);
 /* whether path is a full one, from a root (a drive's or a share's on Windows), not one relative to a working folder */
 int snx_path_is_full(const char* path);
 char* snx_executable(const char* argv0);
@@ -54,11 +87,24 @@ int snx_link_file(const char* src, const char* dst);
 /* link a symbolic link to target, which it names as given: nonzero when it cannot be made (on Windows, without the
    right to make one: developer mode or an administrator) */
 int snx_symlink(const char* target, const char* link);
+/* on Apple, the Vulkan driver a program's own folders carry, for SDL to load instead of the system's loader: the
+   MoltenVK beside it (a game's runtime copy), the app bundle's Frameworks, or the framework in an iOS app. NULL
+   elsewhere, and when its folders have none (the system's loader, which the app's own bundle finds by itself) */
+char* snx_vulkan_driver(const char* program);
+/* put the Vulkan driver program carries in folder, beside the program a game runs there: its copy of the runtime is
+   outside the app's bundle, where neither SDL's search nor a system's loader reaches the library. 0, or 1 with the
+   reason said. Nothing to do, and 0, where the system's loader serves or the program carries none */
+int snx_deploy_vulkan_driver(const char* program, const char* folder);
 int snx_path_within(const char* path, const char* parent);
 int snx_replace(const char* src, const char* dst);
 int snx_list_dir(const char* path, char*** names, size_t* count);
 void snx_free_strings(char** strings, size_t count);
 unsigned char* snx_read_file(const char* path, size_t* size);
+/* Whether the file at path holds a record of size bytes, its first magic_size bytes magic, that accept takes: it is
+   given each such record in the file, at any offset, until it takes one. What a compiled module was compiled for,
+   read from its descriptor in the file before the module is loaded */
+int snx_file_has_record(const char* path, const void* magic, size_t magic_size, size_t size,
+                        int (*accept)(const unsigned char* record, const void* context), const void* context);
 int snx_write_file(const char* path, const void* data, size_t size);
 int snx_write_changed(const char* path, const void* data, size_t size);
 char* snx_temp_dir(const char* parent);
@@ -91,9 +137,13 @@ char* snx_user_dir(int kind);
 /* 1 for a data folder that keeps each kind of file apart: the user's, a portable copy's (SNX_PORTABLE_DIR), Android's.
    Another folder's games (--repo, --outdir) keep their files in their folders */
 int snx_app_dir(const char* folder);
-/* Such a data folder's folder for one kind of file: the user's as snx_user_dir says, another's config/, state/ and
-   cache/ in it; the data folder itself for SNX_USER_DATA */
+/* Such a data folder's folder for one kind of file: for SNX_USER_STATE and SNX_USER_CACHE the one its config folder's
+   app.ini names, [folders] state = and cache = (Settings > App > Folders' Logs and Caches), a full path; else
+   snx_app_kind_default's. One app.ini names wrongly is said once */
 char* snx_app_kind_dir(const char* app, int kind);
+/* Its folder for one kind of file before Folders picks one: the user's as snx_user_dir says, another's config/, state/
+   and cache/ in it; the data folder itself for SNX_USER_DATA */
+char* snx_app_kind_default(const char* app, int kind);
 /* A path in a data folder (snx_app_dir), moved to the same place in its folder of kind: games/X/X.ini of the data
    folder is games/X/X.ini of the config folder. Any other path (another --repo, an --outdir) is returned as it is */
 char* snx_user_path(const char* path, int kind);
@@ -101,6 +151,8 @@ char* snx_user_path(const char* path, int kind);
    state) for a program in folder: the data folder's (snx_app_dir) that folder is in, else the user's. The launcher
    names its data folder, a game its own folder, so a game finds the files of the launcher whose games/ it is in */
 char* snx_menu_dir(const char* folder, int kind);
+/* The same before Folders picks one: snx_app_kind_default's */
+char* snx_menu_kind_default(const char* folder, int kind);
 /* 1 while what an older build left at old is still there, for the caller to say each run where it is and that this
    build keeps it at now. Nothing is moved: the player does that */
 int snx_left_behind(const char* old, const char* now);
@@ -150,20 +202,66 @@ char* snx_dump_name(const char* input);
    folder", "cannot be written" or "is on a disk that runs no programs (noexec)"; NULL when it can */
 const char* snx_folder_unfit(const char* folder, int run);
 SnxU64 snx_free_space(const char* path);
+/* The disk path is on: its bytes free to this user and its size. 0, or -1 with the system's reason (snx_os_error) */
+int snx_disk_room(const char* path, SnxU64* free_bytes, SnxU64* total);
 /* 1 when a and b are on one disk (one file system), each a folder or one still to be made under the nearest folder
    there: what goes into one takes the other's free space */
 int snx_same_disk(const char* a, const char* b);
 /* a and b name the same file, through links: 1, else 0 (one of them missing too) */
 int snx_same_file(const char* a, const char* b);
 SnxU64 snx_file_size(const char* path);
+/* path's last modification in seconds since 1970; 0 when there is no file to give one */
+SnxU64 snx_file_time(const char* path);
+/* path's last modification and access set to seconds since 1970: 0, or nonzero with the system's reason
+   (snx_os_error) */
+int snx_set_file_time(const char* path, SnxU64 seconds);
 int snx_make_executable(const char* path);
 unsigned snx_cpu_count(void);
+/* the threads an AOT pass (a game's recompile) is given when its count is left open: the physical cores where the
+   system says them, else the processors, capped at 75% of that (a reserve of one whole core, or a quarter), so a
+   part of the computer stays free; at least 1, never more than snx_cpu_count() */
+unsigned snx_build_threads(void);
 /* seconds on a monotonic clock, for durations */
 double snx_seconds(void);
 /* Address space for code the process writes and then runs: reserved without access, then given access in whole pages.
    snx_vm_protect commits the pages it makes accessible and decommits them with SNX_VM_NONE on Windows. 0 or -1 */
 enum { SNX_VM_NONE, SNX_VM_READ, SNX_VM_READ_WRITE, SNX_VM_READ_EXECUTE };
 size_t snx_vm_page_size(void);
+/* A run that cannot be killed (the driver on a thread of the app, where an app may start no process) is stopped by
+   asking: the player's abort sets this, and the long loops (the recompiler's units) end early once it is set */
+void snx_abort_request(int on);
+int snx_abort_requested(void);
+/* the memory this process is charged for now, in bytes: its footprint on macOS and iOS, its resident set on Linux,
+   Android and FreeBSD, its working set on Windows; 0 where the system does not tell */
+SnxU64 snx_footprint(void);
+/* the processor time this process has used, every thread's together, in ns; 0 where the system does not tell */
+SnxU64 snx_process_cpu_ns(void);
+/* a thread's time on the processors, which any thread of the process reads: snx_thread_clock gives the calling
+   thread's clock, never 0, or 0 where the system gives none; snx_thread_cpu_ns the time its thread has run so far, in
+   ns, into *ns, and -1 once the thread has ended; snx_thread_clock_close lets go of the clock (a handle on Windows),
+   after which no thread reads it */
+SnxU64 snx_thread_clock(void);
+int snx_thread_cpu_ns(SnxU64 clock, SnxU64* ns);
+void snx_thread_clock_close(SnxU64 clock);
+/* names the calling thread for the system, which debuggers, crash reports, the system's tools and snx_threads show:
+   Linux and Android keep its first 15 bytes, FreeBSD 19, the others 63 (Windows from 10 1607; earlier ones none) */
+void snx_thread_name(const char* name);
+/* one of the process's threads, as snx_threads reads it */
+typedef struct {
+    /* the system's id for it, with its start where the system gives an ended thread's id to a new one (Linux,
+       Android, Windows), so no later thread of the run has it; FreeBSD's alone */
+    SnxU64 id;
+    SnxU64 cpu_ns; /* its time on the processors so far */
+    char name[64]; /* its name for the system, "" for none */
+} SnxThreadInfo;
+/* the process's threads, into out up to max of them: how many the system listed (more than max when some did not
+   fit), or -1 where it lists none. Linux and Android count the time in the system's ticks (10 ms), FreeBSD in
+   microseconds, the others finer. Any thread; it reads a file for each thread on Linux and Android */
+int snx_threads(SnxThreadInfo* out, int max);
+/* the memory the system can still give this process, in bytes, into *bytes: what iOS lets the app take before it ends
+   it, the memory available on Linux and Android (MemAvailable), on macOS (free, inactive and purgeable pages), on
+   FreeBSD (free and inactive pages) and on Windows (available physical memory); whether the system told it */
+int snx_memory_available(SnxU64* bytes);
 void* snx_vm_reserve(size_t size); /* NULL when the system refuses */
 int snx_vm_protect(void* p, size_t size, int access);
 void snx_vm_release(void* p, size_t size);
@@ -179,21 +277,52 @@ char* snx_find_tool(const char* name);
 /* argv is NULL terminated. No shell. Captured output is heap-owned by caller.
    home isolates HOME/USERPROFILE and removes XDG_CONFIG_HOME in the child. */
 int snx_run(const char* const* argv, const char* cwd, const char* home, char** output);
+/* snx_run's, the whole output: snx_run keeps the last megabyte of a long one, a listing needs all of it */
+int snx_run_all(const char* const* argv, const char* cwd, const char* home, char** output);
 /* snx_run calling tick(data) about once a second while the child runs: a long tool can say how far it is */
 int snx_run_ticking(const char* const* argv, const char* cwd, const char* home, char** output, void (*tick)(void*),
                     void* data);
 /* Foreground workflow stage with inherited stdio, interruption forwarding and diagnostics.
    A stopped POSIX child is aborted so a rerun can restart that stage. Not thread safe. */
 int snx_run_stage(const char* const* argv, const char* cwd, const char* stage);
+/* iOS starts no process: a stage then calls run(argc, argv) in this one, argv[0] being the program a child would be.
+   Set once by the driver, whose own main it is */
+void snx_set_stage_runner(int (*run)(int argc, char** argv));
 /* As above, but intentional debugger stops do not abort the game. */
 int snx_run_debug_stage(const char* const* argv, const char* cwd, const char* stage);
 FILE* snx_fopen(const char* path, const char* mode);
+/* The launcher's logs, in its state folder (docs/USAGE.md#folders): what it says, a file a day named after this one
+   (gui/log.h's gui_log_console_name; this name the versions before wrote, kept), and a fatal error of it or of a game
+   in the other one too */
+#define SNX_CONSOLE_LOG "scarletnx-console.log"
+#define SNX_ERROR_LOG   "scarletnx-error.log"
+/* The line a game's runtime prints as it makes the game's log, on the console and in the log, before the log's
+   absolute path: the launcher's Share Log takes the last run's game log from it, whatever the program is named */
+#define SNX_LOG_WRITTEN "log: written to "
+/* text appended to the file at path, each of its lines after the local time and this process's id
+   ("2026-10-25 11:30:02 [4242] "), in one write: two programs appending at once keep each line whole and named, and a
+   text without an ending newline gets one. 0, or -1 with errno set */
+int snx_log_lines(const char* path, const char* text);
+/* An exclusive lock on the file at path, made when it is not there and left as it is, held until snx_unlock_file: 0
+   with *lock set, 1 when another holder has it (another program, or another lock of this one), -1 with errno. The
+   file's bytes stay free to be read and written by anyone: POSIX's flock, which only other locks see, and on Windows a
+   lock of one byte past any end the file reaches */
+int snx_lock_file(const char* path, intptr_t* lock);
+void snx_unlock_file(intptr_t lock);
 /* f to offset from its start, past 2 GiB too (fseek takes a long, 32 bits on Windows); 0, or nonzero */
 int snx_seek(FILE* f, SnxU64 offset);
+/* f's offset from its start, past 2 GiB too; signed, so that -1 can report an error */
+int64_t snx_tell(FILE* f);
 
+/* 1 when the n bytes at text are well-formed UTF-8 (no overlong form, surrogate, or code point past U+10FFFF), else 0
+   and the first 16 of them in hex into hex ("2a 9c e3", "..." after when there are more), when hex_size is not 0 */
+int snx_utf8_valid(const char* text, size_t n, char* hex, size_t hex_size);
 /* The game's name in a control.nacp: American English's, else the first language's that has one, in UTF-8 without
-   control characters. 1 when it has one, else 0 and "" */
+   control characters, its titles inflated when the NACP keeps them in deflate (TitleCompression). A name whose bytes
+   are not UTF-8 counts as none. 1 when it has one, else 0 and "" */
 int snx_nacp_name(const unsigned char* nacp, size_t size, char* name, size_t name_size);
+/* snx_nacp_name, and when it has no name, why into why (its bytes in hex for a name that is not UTF-8); "" else */
+int snx_nacp_name_why(const unsigned char* nacp, size_t size, char* name, size_t name_size, char* why, size_t why_size);
 /* The title ID of a program without an NPDM (an NRO, an ExeFS without main.npdm): none of its own */
 #define SNX_NPDM_DEFAULT_TITLE 0x0100000000001000ull
 /* The title ID a main.npdm's ACI0 gives its program, as the loader reads it, for one not loaded; SNX_NPDM_DEFAULT_TITLE
@@ -219,12 +348,28 @@ int snx_addon_entry_id(SnxU64 game, const char* entry, SnxU64* id);
 void snx_addon_entry(SnxU64 game, SnxU64 id, SnxU64 version, char entry[32]);
 /* the version an update's entry names, SNX_NO_VERSION for none */
 SnxU64 snx_addon_version(const char* entry);
-enum { SNX_ADDON_NONE, SNX_ADDON_UPDATE, SNX_ADDON_DLC };
+/* a save's note, <its folder> and this beside the folder: which program and version committed the save last (fs.c's
+   save_note). What moves a save's folder moves its note with it */
+#define SNX_SAVE_NOTE ".version"
+enum { SNX_ADDON_NONE, SNX_ADDON_UPDATE, SNX_ADDON_DLC, SNX_ADDON_PROGRAM };
 /* what the title id is to the game: SNX_ADDON_UPDATE for its patch (its ID with 0x800, as the console makes every
-   patch's), SNX_ADDON_DLC for any other, SNX_ADDON_NONE for the game's own (or 0) */
+   patch's), SNX_ADDON_PROGRAM for another program of its application or that program's patch (snx_program_index),
+   SNX_ADDON_DLC for any other, SNX_ADDON_NONE for the game's own (or 0) */
 int snx_addon_kind(SnxU64 game, SnxU64 id);
+/* An application of several programs (a collection whose menu starts each game, nn::oe::ExecuteProgram) numbers them
+   from its own ID, as the console does: program i is the application's ID plus i, and that program's patch the
+   update's ID plus i. The index is a byte (fs's ProgramIndexMapInfo), 0 the application's own program */
+#define SNX_PROGRAMS_MAX 256
+/* id's program index in the application game: 0 for the game or its update, i for its program i or that program's
+   patch, -1 for an ID that is none of its programs (a DLC's) */
+int snx_program_index(SnxU64 game, SnxU64 id);
+/* the program of index of the application game (its title ID as snx_title_text writes it) as the game's folder names
+   it, played with the update whose entry is update (snx_addon_entry, its version in it; NULL or "" for none) into
+   out: <game> or <game>_<update> for 0, <game>_<game + index> or <game>_<the update's ID + index>v<version> for
+   another. 0, or nonzero for an index past SNX_PROGRAMS_MAX or an out too short */
+int snx_program_name(const char* game, const char* update, int index, char* out, size_t size);
 /* the game an add-on's ID would belong to by the usual numbering, for a dump without a content meta to name it: a
-   patch's ID less 0x800, add-on content's below its 0x1000 */
+   patch's ID (a program's too) less its 0x800 and index, add-on content's below its 0x1000 */
 SnxU64 snx_addon_guess(SnxU64 id);
 /* the ID a game's add-on content is numbered from, its control.nacp's AddOnContentBaseId (aoc:u's base ID): a DLC's
    data ID is it plus the DLC's index, 1 to 2047. The SDK's default for application when nacp is NULL or sets none */

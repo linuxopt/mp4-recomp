@@ -8,8 +8,21 @@
 #include "common/utilities/endian.h"
 #include <string.h>
 
-/* The host reservation (128 GiB). A guest address of either width is an offset below it */
-#define AS_SIZE 0x2000000000ull
+/* The console's 64-bit layout lies below this (128 GiB): the code, alias, heap and stack regions and the kernel's
+   pages. NCE's reservation at the guest's own addresses is no larger (mem_reserve_identity) */
+#define AS_MAX 0x2000000000ull
+/* The console's 64-bit address space (512 GiB), the most host address space the guest gets: its addresses end below
+   it, within the 39 bits an IPC buffer descriptor carries, and tables indexed by guest address are sized for it */
+#define AS_TOP 0x8000000000ull
+/* A 64-bit application of the pre-2.0 address space type: the console gives these 64 GiB, and everything the game
+   holds (an IPC buffer descriptor's address among them) has to fit in 36 bits */
+#define AS36 (1ull << 36)
+/* The host reservation, which a guest address of either width is an offset below: AS_TOP, or less where the system
+   gives less address space (a 39-bit kernel, RLIMIT_AS, iOS without the paid extended-virtual-addressing entitlement),
+   when mem_reserve picks a smaller layout to fit it. Under NCE on Android the end of the layout it moved up
+   (mem_layout_move) */
+extern u64 g_as_size;
+#define AS_SIZE (g_as_size)
 
 /* The regions of the address space. The 64-bit layout is g_layout's static value, so it holds before mem_layout32 */
 typedef struct {
@@ -32,8 +45,10 @@ typedef struct {
 /* where a 32-bit process's first module goes */
 #define AS32_CODE_BASE 0x200000ull
 
-/* the host address of guest address a */
-#define GP(a) (g_mem + (u64)(a))
+/* the host address of guest address a. In integers: under NCE g_mem is 0, and a pointer made by adding to a null one
+   is undefined, which lets the compiler take any pointer GP makes for non-null exactly when g_mem is, and drop the
+   checks of it (one game's every program bind went empty that way) */
+#define GP(a) ((u8*)(uintptr_t)((uintptr_t)g_mem + (u64)(a)))
 
 /* a run of pages with one state, permission and attribute (QueryMemory's MemoryInfo, less the address width) */
 typedef struct {
@@ -73,12 +88,48 @@ enum {
 };
 /* MemoryPermission */
 enum { PERM_NONE = 0, PERM_R = 1, PERM_W = 2, PERM_RW = 3, PERM_X = 4, PERM_RX = 5, PERM_DONTCARE = 0x10000000 };
+/* MemoryAttribute: the bits svcSetMemoryAttribute names, and the set it may change (Uncached and PermissionLocked) */
+enum { MA_LOCKED = 1, MA_IPC_LOCKED = 2, MA_DEVICE_SHARED = 4, MA_UNCACHED = 8, MA_PERMISSION_LOCKED = 0x10 };
+#define MA_SET_MASK 0x18u
 /* what the calls below return besides 0 */
 enum { MEM_BADSTATE = -1, MEM_NOMEM = -2, MEM_LIMIT = -3 };
 
 /* the console's layout below 4 GiB for a 32-bit process, by the NPDM's address space type: 0 with the alias region, 2
    without */
 void mem_layout32(unsigned aspace);
+/* the console's 64 GiB layout for a 64-bit process of the pre-2.0 address space type (the NPDM's 1), where every
+   guest address has to fit in 36 bits */
+void mem_layout36(void);
+/* The guest's address space reserved now, the largest tier the system gives from the console's 128 GiB down to 5 GiB,
+   each refused one said: before the game's code takes a share of a small one. mem_init finds it kept, and sets its
+   written-page tracking up once the settings are read (plat_vm_track) */
+void mem_reserve(void);
+/* whether mem_reserve reserved the guest's address space: g_mem, or the guest's own addresses (mem_identity) */
+int mem_reserved(void);
+/* 1 when the guest's addresses are the host's, for NCE: g_mem is 0 */
+int mem_identity(void);
+/* Where host address p lies against the guest's reservation, as a crash report says it: in it (with its game
+   address), below its start, or past its end (with the start or the end and how far, and the layout's size beside the
+   console's 512 GiB), or that none is reserved yet */
+void mem_place(const void* p, char* out, size_t size);
+/* Under NCE, what of the host's process lies in the guest's reservation and is not the guest's (plat_vm_foreign): their
+   count, each one named in out. The runtime gives none of the reservation's pages back, and what it maps there from a
+   file is its own (the alias pool, a GPU buffer guest memory moved into: mem_migrate), so anything else is another
+   owner's, mapped over guest memory at an address of its own choosing. 0 when there is none; -1 without NCE's
+   reservation (elsewhere the system placed it, where no other owner picks a fixed address), or where the system does
+   not say (errno) */
+int mem_foreign(char* out, size_t size);
+/* 0 when the host tracks the writes to guest memory (plat_ww_scan), -1 when it can't: a scan, reported to cb, of the
+   first page the tracking covers. Under NCE that is the code region's base at the guest's own addresses, as g_mem is
+   0 there, below the tracked range */
+int mem_ww_probe(void (*cb)(u8* p, u64 size));
+/* NCE's reservation at the guest's own addresses (mem.c says why), the layout moved up by from or more: 1, or 0 with
+   the reason logged. POSIX only */
+int mem_reserve_identity(u64 from);
+/* every region of the layout, and AS_SIZE, by more: the guest's addresses start that far up (NCE on Android) */
+void mem_layout_move(u64 by);
+/* how far mem_layout_move moved the layout, 0 when it stays at the console's addresses */
+u64 mem_moved(void);
 void mem_init(void);
 int mem_map(u64 addr, u64 size, u32 state, u32 perm); /* 0, MEM_BADSTATE when it isn't free, MEM_NOMEM */
 int mem_unmap(u64 addr, u64 size);
@@ -94,6 +145,35 @@ void mem_query(u64 addr, MemBlock* out);
 /* the bytes of [addr, addr + size) still mapped, up to the first free or inaccessible page: what a GPU mapping older
    than the guest's frees may read (gpu.c's copy_runs). All of them before mem_init, with no block list */
 u64 mem_mapped_run(u64 addr, u64 size);
+/* fn(a, size) when the host pages under guest memory [a, a + size) are replaced or go, under mem.c's lock */
+void mem_set_pages_replaced(void (*fn)(u64 a, u64 size));
+/* Guest memory a GPU reads in place from a buffer of its own (gpu/vk/uma.c, where the driver can't import host memory,
+   as on Android): [a, a + size), in whole host pages, moves to the pages of fd, a buffer that large, with its bytes,
+   pages another buffer had included; mem_unmigrate moves the parts of [a, a + size) still in one back to the
+   reservation's own pages with their bytes. Unmapping or decommitting moved pages, or moving them into the pool, puts
+   other pages there; the moves themselves don't call the hook above, as the caller holds the buffer. 0, MEM_BADSTATE
+   (not all of it is what mem_movable says), or MEM_NOMEM when the host can't share them */
+int mem_migrate(u64 a, u64 size, int fd);
+int mem_unmigrate(u64 a, u64 size);
+/* whether [a, a + size) is all the guest's data, in whole host pages, on the reservation's own pages (not the pool's,
+   which other mappings share, nor the renderer's placed windows below): what mem_migrate moves */
+int mem_movable(u64 a, u64 size);
+/* The renderer's GPU memory under the heap and physical memory (gpu/vk/uma.c, VK_EXT_map_memory_placed), a window of
+   MEM_PLACED bytes at a time, mapped at its guest address. Each call takes a range within one window, under mem.c's
+   lock and the renderer's: commit makes it readable and writable and zero, 0, or -1 when the window isn't the
+   renderer's (host pages then); decommit makes it inaccessible, 1, or 0 when it isn't the renderer's; held tells
+   whether a page of [a, a + size), any windows, is the renderer's. Its pages are never moved into the alias pool nor
+   into a GPU's buffer (mem_migrate), a window with pages in one is never the renderer's, and the GPU's results over
+   them aren't trapped: a view of them (MapMemory's, code memory's) is view(dst, src, size), the same pages mapped at
+   free dst again, 0, or -1 when it can't be (a copy then) */
+#define MEM_PLACED (2ull << 20)
+typedef struct {
+    int (*commit)(u64 a, u64 size);
+    int (*decommit)(u64 a, u64 size);
+    int (*held)(u64 a, u64 size);
+    int (*view)(u64 dst, u64 src, u64 size);
+} MemPlaced;
+void mem_set_placed(const MemPlaced* p);
 int mem_set_state(u64 addr, u64 size, u32 state, u32 perm);
 int mem_set_attr(u64 addr, u64 size, u32 mask, u32 attr);
 /* Called with no memory lock held after a mapping change that can make compiled guest code stale: an unmap, a state
@@ -111,6 +191,14 @@ int mem_alias_begin(u64 src, u64 size);
 int mem_alias_map(u64 dst, u64 src, u64 size, u32 state, u32 perm);
 int mem_alias_unmap(u64 dst, u64 size, u64 back);
 void mem_alias_end(u64 src, u64 size);
+/* whether a view shares its source's pages: the alias pool is on (a view is a copy without it) */
+int mem_pool_active(void);
+/* Pages with two addresses (a view and its source, shared memory mapped twice, on a host with the pool): fn(user, at,
+   n) for each other guest range [at, at + n) that maps the pool pages behind [a, a + size), under the memory lock
+   (fn takes no lock of mem.c's). Nothing for a range no other address maps, and no lock for one whose 4 MiB grains
+   no such page is on. mem_alias_any: whether any page may have two addresses now, without the lock */
+void mem_alias_peers(u64 a, u64 size, void (*fn)(void* user, u64 at, u64 n), void* user);
+int mem_alias_any(void);
 /* Pool pages of their own (shared memory): size bytes mapped outside the reservation at the pointer returned, with
    their pool offset in off; NULL without a pool or when it is full */
 u8* mem_pool_host(u64 size, u64* off);
@@ -130,6 +218,35 @@ typedef struct {
 int mem_own_prepare(u64 a, u64 size, MemPoolRun* runs, u32 max, u32* n);
 /* the pool offset of guest address a: 0, or -1 when a isn't pool memory */
 int mem_pool_offset(u64 a, u64* off);
+
+/* ---- save states (runtime/state.c), with the game paused and nothing of the GPU's left in guest memory */
+/* The pool's pages in use, in offset order: a run a service maps outside the reservation (a shared memory's pages,
+   mem_pool_host) has host set, and the rest is cut at its ends, so each span is one or the other */
+typedef struct {
+    u64 off, size;
+    int host;
+} MemSpan;
+/* the blocks (mem_query's) and the spans into out, max at most: how many there are */
+u32 mem_blocks(MemBlock* out, u32 max);
+u32 mem_spans(MemSpan* out, u32 max);
+int mem_pool_read(u64 off, void* dst, u64 size); /* 0, or -1 */
+/* A load's new address space, from a state's blocks and spans. mem_restore_begin takes the renderer's lock and the
+   memory lock, lets go of what the GPU holds, and unmaps every block but the modules' code (MS_CODE, which a state
+   keeps as the game loaded it) and every span but the services' host views (a load reconciles those with their
+   shared memories itself, mem_pool_host and mem_pool_host_free, before it begins). Then mem_restore_alloc places
+   each of the state's other spans anew (its offset, or ~0 when the pool is full), mem_restore_write fills them,
+   mem_restore_blocks makes the block list the state's (its pool offsets already this run's, its MS_CODE blocks those
+   mapped now) and maps and commits it, the caller writes the other blocks' bytes at GP, and mem_restore_end sets the
+   heap's and physical memory's sizes, lets go of the locks and tells the JIT and the renderer every block changed.
+   Every call but mem_restore_end returns 0, or -1 with nothing more to do but mem_restore_end */
+int mem_restore_begin(void);
+u64 mem_restore_alloc(u64 size);
+int mem_restore_write(u64 off, const void* p, u64 size);
+int mem_restore_blocks(const MemBlock* blk, u32 n);
+void mem_restore_end(u64 heap_size, u64 phys_mapped);
+/* before any of that, while the game runs: whether blk (n of them) is a block list mem_restore_blocks takes, one that
+   covers the address space in order with the code mapped now. 0, or -1 */
+int mem_restore_check(const MemBlock* blk, u32 n);
 
 extern MemLayout g_layout;
 extern u8* g_mem;

@@ -33,6 +33,7 @@ extern Paths P;
 bool file_exists(const std::string& p);
 bool dir_exists(const std::string& p);
 long long file_size(const std::string& p);
+double disk_free_gb(const std::string& dir);   // free space for this user on dir's drive, -1 if unknown
 bool make_dirs(const std::string& p);
 std::string read_text(const std::string& p);
 bool write_text(const std::string& p, const std::string& s);
@@ -119,6 +120,18 @@ bool update_restart();   // starts the game's EXE again; the caller then exits
 bool update_backup_exists();   // Undo has something to put back
 void update_startup();         // Linux: a new AppImage whose recompiler differs asks for the rebuild
 void update_setup_done();      // setup or a rebuild finished: the game code matches this recompiler
+
+// ---------------------------------------------------------------- pinned model downloads (Graphics page; fe_update.cpp, Windows)
+// nvngx_dlss.dll and the AMD frame generation DLLs are not in the release: each is downloaded at a pinned version and
+// kept only if it matches
+#ifdef _WIN32
+enum PinnedStage { PIN_IDLE, PIN_DOWNLOADING, PIN_DONE, PIN_ERROR };
+struct PinnedDownloadState { PinnedStage stage = PIN_IDLE; float pct = 0; std::string error; };
+void dlss_download_async();                 // starts the download on its own thread (does nothing while one runs)
+PinnedDownloadState dlss_download_state();
+void fsr_download_async();                  // AMD frame generation: the same, for its two files
+PinnedDownloadState fsr_download_state();
+#endif
 
 // ---------------------------------------------------------------- controllers (front end only; the game has its own)
 struct PadInfo { int index; std::string name; };

@@ -444,7 +444,12 @@ def main():
         import switchrecomp, nxloader, codegen   # the SwitchRecomp translator, bundled next to this script
         gen_marker = os.path.join(build, '.generated')
         gen_key = hashlib.sha1(open(os.path.join(ex_dst, 'main'), 'rb').read()[:0x100] + (open(PATCHES, 'rb').read() if os.path.isfile(PATCHES) else b'')
-                               + open(os.path.join(HERE, 'codegen.py'), 'rb').read() + open(os.path.join(HERE, 'metroid_perf.py'), 'rb').read()).hexdigest()
+                               + open(os.path.join(HERE, 'codegen.py'), 'rb').read() + open(os.path.join(HERE, 'metroid_perf.py'), 'rb').read()
+                               + open(os.path.join(HERE, 'logic_rate.py'), 'rb').read()
+                               + open(os.path.join(HERE, 'mouse_aim.py'), 'rb').read()
+                               # the instruction templates, and the switch that turns the second inline SIMD tier on
+                               + open(os.path.join(HERE, 'a64.py'), 'rb').read()
+                               + ('simd_inline=%s' % os.environ.get('SWR_SIMD_INLINE', '0')).encode()).hexdigest()
         if os.path.isfile(gen_marker) and open(gen_marker).read().strip() == gen_key:
             log('Generated code already in place: kept')
             files = sorted(os.path.join(build, f) for f in os.listdir(build) if f.startswith('code_') and f.endswith('.c'))
@@ -493,10 +498,16 @@ def main():
         P(31, 'Compiling with GCC', '0 of %d files' % len(files))
 
         if WIN:
-            cc = os.path.join(HERE, 'gcc', 'Library', 'bin', 'gcc.exe')   # always the bundled one, never a gcc on PATH
+            # the bundled GCC, never one that merely happens to be on PATH; a build from source names its own with $CC
+            cc = os.path.join(HERE, 'gcc', 'Library', 'bin', 'gcc.exe')
             cc = cc if os.path.isfile(cc) else None
+            if not cc and os.environ.get('CC'):
+                cc = shutil.which(os.environ['CC'])
+                if not cc:
+                    raise Fail('CC is set to %s, which was not found.' % os.environ['CC'])
             if not cc:
-                raise Fail('The bundled GCC is missing (recompiler\\gcc). Extract the release again.')
+                raise Fail('The bundled GCC is missing (recompiler\\gcc). Extract the release again '
+                           '(a build from source: set CC to a MinGW-w64 gcc.exe, for example MSYS2 UCRT64\'s).')
         else:
             # $CC, else the GCC bundled next to this script (the AppImage's recompiler/gcc), else the system's
             cc = shutil.which(os.environ['CC']) if os.environ.get('CC') else None

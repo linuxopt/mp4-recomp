@@ -38,6 +38,8 @@ See **Build from source** in the README, or run `build.bat` from the repository 
 - **Licences:** your code is under the licence of the file you change (Apache-2.0 for the SwitchRecomp runtime and
   tools, GPL-3.0 under `runtime/snxvk/`). The released EXE as a whole is GPL-3.0.
 - **No DLSS SDK files** (headers, libraries or `nvngx_dlss.dll`) in the repository.
+- **No AMD FidelityFX DLLs** (`amd_fidelityfx_*.dll`) in the repository or the release: the launcher downloads them.
+  Only the SDK's MIT-licensed API headers are vendored, in `runtime/snxvk/deps/FidelityFX-SDK-2.4.0`.
 
 ## AI-assisted contributions
 

@@ -43,6 +43,10 @@ typedef struct {
 } ShaderInfo;
 /* malloc'd GLSL, or NULL */
 char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si);
+/* comment put in a shader whose BRX table is unknown, so every instruction is a switch case. Output with that
+   shape and without this comment comes from a translator that missed tables the scheduler hoisted; it is retried */
+#define SH_ALL_CASES "every instruction is a jump target"
+int shader_glsl_stale(const char* src);
 extern int (*g_shader_cb_read)(u32 idx, u32 off, u32* out);
 u64 shader_hash(const u8* code, u32 max_bytes, u32* out_len);
 /* global buffer (SSBO) binding of buffer i of a draw stage (slot 0 vertex, 1 pixel, 2 geometry): the first 8 keep

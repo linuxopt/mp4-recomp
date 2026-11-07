@@ -27,6 +27,10 @@ typedef struct {
        every own_begin and own_drop caller holds it */
     void (*lock)(void);
     void (*unlock)(void);
+    /* the host pages [addr, addr + size) of a landing, whose bytes (size of them) are as it left them, read before
+       the pages are let go of: the write tracking, which takes pages it watches again for written, can tell a later
+       write from them. Called with the producer's lock held. Optional */
+    void (*landed)(u64 addr, u64 size, const u8* bytes);
 } OwnHooks;
 
 /* 0 when the host can trap guest memory (plat_trap_init): own_begin can work from then on. -1: producers land their
@@ -40,8 +44,8 @@ int own_begin(u64 addr, u64 size, void* res, u64 res_off);
    than max when they didn't all fit). With the producer's lock held, as the resources live while it is */
 u32 own_lookup(u64 addr, u64 size, OwnRange* out, u32 max);
 /* the CPU's bytes of [addr, addr + size) copied to dst without touching a trapped page (read through the pool's
-   mirror), and its owned parts (clipped, in address order) in out, whose bytes in dst are stale: the caller copies
-   them from their resources over dst there. How many owned parts there are; more than max when they didn't fit, and
+   mirror), and its owned parts (clipped, in address order) in out, whose bytes in dst are left as they were: the
+   caller copies them from their resources over dst there. How many owned parts there are; more than max when they didn't fit, and
    nothing was copied then. With the producer's lock held, as own_lookup */
 u32 own_stage(u64 addr, u64 size, u8* dst, OwnRange* out, u32 max);
 /* change detection over [addr, addr + size) without touching it: 1 when GPU-owned bytes are on its pages, which must
@@ -58,7 +62,16 @@ void own_drop(u64 addr, u64 size);
 /* landings so far (each a wait for the GPU: the statistics count them), and whether own_init found traps */
 u64 own_landings(void);
 int own_traps(void);
+/* SWR (own_win.c, Windows without a mirror): [addr, addr + size) copied to dst when none of its pages is trapped: 0,
+   else -1 and nothing copied, for a reader that may not land; whether this thread is landing for its own fault; the
+   threads stopped for landings so far and the time it took; and the [Graphics] vk_memory_traps switch */
+int own_read_open(u64 addr, u64 size, u8* dst);
+int own_in_fault(void);
+void own_stop_stats(u64* stops, u64* ns);
+extern int g_swr_memory_traps;
+/* the entries own.c holds, changed under its lock with __atomic_store_n */
+extern u32 g_nown;
 /* whether anything is owned: the common case's test, without a lock */
-extern int g_own_any;
+static inline int own_any(void) { return __atomic_load_n(&g_nown, __ATOMIC_ACQUIRE) != 0; }
 
 #endif

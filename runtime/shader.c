@@ -1201,12 +1201,32 @@ int shader_program_check(const u8* code, u32 max_bytes, u32* out_len, int* type)
   return 0;
 }
 
-/* BRX targets from its jump table (LDC nearby -> cbuf). -1 if we can't tell */
+/* the LDC that loads a BRX's table entry, or 0. The nearest one within 8 slots, else one further up that reaches
+   the BRX through straight-line code: no branch or exit in between, no other write to the register, and no branch
+   from elsewhere landing in between. The scheduler hoists the load that far in big shaders; left unresolved, every
+   instruction becomes a switch case and NVIDIA spends minutes on the shader only to fail with "too many instructions" */
+static u32 brx_ldc(const u64* w, u32 i, u32 n, u32 ra){
+  for(u32 k=1;k<=8 && k<i;k++){ u32 j=i-k; if(!IDX_OK(j)) continue; const Op* o2=decode(w[j]);
+    if(o2 && o2->id==O_LDC && B(w[j],0,8)==ra) return j; }
+  u32 j=0;
+  for(u32 k=1;k<=64 && k<i && !j;k++){ u32 s=i-k; if(!IDX_OK(s)) continue; const Op* o2=decode(w[s]); if(!o2 || is_term(o2->id)) return 0;
+    if(B(w[s],0,8)!=ra) continue;
+    if(o2->id!=O_LDC) return 0;
+    j=s; }
+  if(!j) return 0;
+  for(u32 q=11;q<n;q++){ if(!IDX_OK(q)) continue; const Op* o=decode(w[q]); if(!o) continue;
+    if(o->id==O_BRA||o->id==O_SSY||o->id==O_PBK||o->id==O_PCNT){ u32 t=bra_target(w[q],q); if(t>j && t<=i) return 0; } }
+  return j; }
+
+/* every instruction a case (11, 12 and 13 are cases only then), a BRX, and no SH_ALL_CASES comment */
+int shader_glsl_stale(const char* src){
+  return src && strstr(src,"uint t_ = uint(") && strstr(src,"\n    case 12u:\n") && strstr(src,"\n    case 13u:\n") && !strstr(src,SH_ALL_CASES); }
+
+/* BRX targets from its jump table (LDC -> cbuf). -1 if we can't tell */
 static int brx_targets(const u64* w, u32 i, u32 n, u32* out, int max){
   if(!g_shader_cb_read) return -1;
   u32 ra=B(w[i],8,8); i32 imm=(i32)(B(w[i],20,24)<<8)>>8;
-  for(u32 k=1;k<=8 && k<i;k++){ u32 j=i-k; if(!IDX_OK(j)) continue; const Op* o2=decode(w[j]);
-    if(!o2 || o2->id!=O_LDC || B(w[j],0,8)!=ra) continue;
+  { u32 j=brx_ldc(w,i,n,ra); if(!j) return -1;
     u32 cidx=B(w[j],36,5); i32 coff=(i32)(B(w[j],20,16)<<16)>>16; int cnt=0, seen=0;
     for(u32 e=0;e<64 && cnt<max;e++){ u32 v; if(!g_shader_cb_read(cidx,(u32)(coff+(i32)e*4),&v)) break;
       i32 bb=(i32)v+imm; if(bb<0 || (bb&7)) break; u32 t=i+1+(u32)(bb/8); if(t>=10 && ((t-10)&3)==0) t++;
@@ -1354,7 +1374,8 @@ char* shader_to_glsl(const u8* code, u32 max_bytes, int stage, ShaderInfo* si){
     while(sp){ sp--; c->indent=sp+1; emitl(c,"}"); }
     if(exit_end!=c->out.n){ c->indent=1; emitl(c,"return;"); } }   /* no second return after the final EXIT */
   else if(fwd) sb_put(&c->out,"  uint pc = 11u;\n");
-  else if(flow){ sb_put(&c->out,"  uint pc = 11u; uint guard_ = 0u;\n  while(true){\n    if(++guard_ > 16384u) return;\n    switch(pc){\n"); }
+  else if(flow){ if(all_ldr) sb_put(&c->out,"  /* " SH_ALL_CASES " */\n");   /* tells this output from the stale kind (shader.h) */
+    sb_put(&c->out,"  uint pc = 11u; uint guard_ = 0u;\n  while(true){\n    if(++guard_ > 16384u) return;\n    switch(pc){\n"); }
   /* dead code still goes through translation (keeps ShaderInfo/decls the same), the text is thrown away */
   int dead=0; Sb live={0};
   for(u32 i=11;i<n && !stru;i++){

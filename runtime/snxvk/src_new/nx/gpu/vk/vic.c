@@ -86,18 +86,32 @@ typedef struct {
     u32 n;
 } Copies;
 
-/* plane pl's bytes into the staging at host (its place at `at` in the job's buffer): the CPU's from guest memory, the
-   GPU's as copies into the job's buffer */
-static void plane_stage(const VicPlane* pl, u8* host, u64 at, Copies* cp) {
+/* plane pl's bytes into the staging at host + at (its place in the job's buffer): the CPU's from guest memory, the
+   GPU's as copies into the job's buffer. The bytes from done (where those written before it end) to at are cleared
+   first. Where the plane's bytes end */
+static u64 plane_stage(const VicPlane* pl, u8* host, u64 at, u64 done, Copies* cp) {
     OwnRange o[16];
     u32 n, i;
-    if (!pl->p || !pl->lim) return;
+    VkBuffer ib;
+    u64 io;
+    if (!pl->p || !pl->lim) return done; /* nothing here: its space, if it has any, is cleared with what follows */
+    memset(host + done, 0, at - done);
+    /* written in place on the GPU (uma.c: an NVDEC picture, the last job's output), not done yet: copied from guest
+       memory on the GPU, after the write */
+    if (cp->n < sizeof cp->c / sizeof *cp->c && vk_uma_copy_pending((u64)(pl->p - g_mem), pl->lim, &ib, &io)) {
+        cp->src[cp->n] = ib;
+        cp->c[cp->n] = (VkBufferCopy){io, at, pl->lim};
+        cp->n++;
+        return at + pl->lim;
+    }
+    vk_uma_mem_need_cpu((u64)(pl->p - g_mem), pl->lim); /* or waited for */
+    host += at;
     n = own_stage((u64)(pl->p - g_mem), pl->lim, host, o, sizeof o / sizeof *o);
     if (n > sizeof o / sizeof *o || cp->n + n > sizeof cp->c / sizeof *cp->c) {
         /* more owners than noted: what the GPU holds of the plane lands, and it is read as it is then */
         own_acquire((u64)(pl->p - g_mem), pl->lim);
         memcpy(host, pl->p, pl->lim);
-        return;
+        return at + pl->lim;
     }
     for (i = 0; i < n; i++) {
         const VkOwnRes* r = (const VkOwnRes*)o[i].res;
@@ -107,6 +121,7 @@ static void plane_stage(const VicPlane* pl, u8* host, u64 at, Copies* cp) {
         cp->c[cp->n].size = o[i].size;
         cp->n++;
     }
+    return at + pl->lim;
 }
 
 static int compose(const VicJob* j) {
@@ -152,18 +167,21 @@ static int compose(const VicJob* j) {
     }
     Copies cp;
     cp.n = 0;
-    memset(host, 0, total); /* the padding between planes, which the shader may load and never uses */
     memcpy(host, &p, sizeof p);
     snx_le32_array(host, sizeof p / 4); /* host numbers, all 32 bit words (vic_params.glsl), read little-endian */
+    /* every plane's bytes are staged whole, so only the padding between them is cleared: the shader may load it and
+       never uses it (a whole frame cleared and then copied over was most of a video's CPU time) */
+    u64 done = sizeof p;
     for (int s = 0; s < 8; s++) {
         const VicSlot* sl = &j->slots[s];
         if (!sl->on) continue;
-        plane_stage(&sl->iy, host + in_offs[2 * s], in_offs[2 * s], &cp);
-        plane_stage(&sl->ic, host + in_offs[2 * s + 1], in_offs[2 * s + 1], &cp);
+        done = plane_stage(&sl->iy, host, in_offs[2 * s], done, &cp);
+        done = plane_stage(&sl->ic, host, in_offs[2 * s + 1], done, &cp);
     }
     /* the output planes come in: the shader owns whole words and leaves the other bytes as they are */
-    plane_stage(&j->oy, host + ol_off, ol_off, &cp);
-    plane_stage(&j->oc, host + oc_off, oc_off, &cp);
+    done = plane_stage(&j->oy, host, ol_off, done, &cp);
+    done = plane_stage(&j->oc, host, oc_off, done, &cp);
+    memset(host + done, 0, total - done);
 
     VkDescriptorBufferInfo buffers[3] = {{w->buf, 0, sizeof(VicGpuParams)},
                                          /* from 0: in_offs count from the start of the buffer */
@@ -213,5 +231,9 @@ int vk_vic_compose(const VicJob* j) {
     vk_lock();
     int r = compose(j);
     vk_unlock();
+    /* with unified memory the planes are copied in on the GPU and no trap lands them: host1x increments the job's
+       syncpoint once this returns, and the guest reads them then */
+    if (r) vk_uma_mem_need_cpu((u64)(j->oy.p - g_mem), j->oy.lim);
+    if (r && j->oc.p && j->oc.lim) vk_uma_mem_need_cpu((u64)(j->oc.p - g_mem), j->oc.lim);
     return r;
 }

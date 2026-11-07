@@ -43,6 +43,7 @@ class Program:
         # keep only control flow per instruction (1 byte state each); storing the C for everything
         # doesn't fit in RAM for ~100 MB of code
         self.cf = {}              # addr -> (w, branch tuple or None)
+        self.overrides = {}       # addr -> C replacing a plain (non-branch) instruction, title fixes (logic_rate.py)
         for m in mods: m._st = bytearray(m.text[1] // 4 + 1)   # 0 unseen, 1 plain, 2 in cf
 
     def mod_of(self, a):
@@ -260,6 +261,9 @@ def emit_function(prog, f, funcs):
         if w is None or r is None:
             out.append(' c->pc=%s; c->rt->undef(c,%s,%s); return;' % (lit(x), lit(x), lit(w or 0)))
             continue
+        if x in prog.overrides:
+            if not isinstance(r, str): raise RuntimeError('override at %X replaces a branch' % x)
+            r = prog.overrides[x]
         if isinstance(r, str):
             if r: out.append(' ' + fix_undef(r, x, w))
         else:

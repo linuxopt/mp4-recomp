@@ -62,8 +62,13 @@ static struct {
 
 static void xfb_ext(VkExtensionProperties* have, u32 n, const char** ext, u32* next, u32 max);
 static void mv_frame(int evaluated);
+static void fg_point(void);
 /* the INI's dlss= (0 off, 1 DLAA, 2 quality, 3 balanced, 4 performance), from runtime/snxvk_glue.c */
 extern int snxvk_dlss_mode;
+/* FSR frame generation (fsr_fg.c) */
+int vk_fsr_fg_wanted(void);
+int vk_fsr_fg_active(void);
+void vk_fsr_fg_scene(Surf* z, VkImage mv, u32 w, u32 h, u32 rw, u32 rh, float jx, float jy, int reset);
 int vk_dlss_wanted(void);
 int vk_dlss_wanted(void) { return snxvk_dlss_mode > 0 || getenv("SWR_DLSS_PROBE") != NULL; }
 
@@ -147,7 +152,9 @@ void vk_dlss_device_exts(VkPhysicalDevice pd, const char** ext, u32* next, u32 m
 void vk_dlss_device_exts(VkPhysicalDevice pd, const char** ext, u32* next, u32 max) {
     unsigned ni = 0, nd = 0;
     const char **ie = NULL, **de = NULL;
-    if (!vk_dlss_wanted() || !core_load() || !NGX_OK(g_ngx.req_ext(&ni, &ie, &nd, &de))) return;
+    int ngx = vk_dlss_wanted() && core_load() && NGX_OK(g_ngx.req_ext(&ni, &ie, &nd, &de));
+    if (!ngx) nd = 0;
+    if (!ngx && !vk_fsr_fg_wanted()) return; /* FSR frame generation wants the motion vectors too (fsr_fg.c) */
     u32 n = 0;
     vkEnumerateDeviceExtensionProperties(pd, NULL, &n, NULL);
     VkExtensionProperties* have = calloc(n ? n : 1, sizeof *have);
@@ -249,7 +256,53 @@ static struct {
 } g_dl;
 
 static int dl_active(void) { return g_ngx.available && snxvk_dlss_mode > 0 && !g_dl.failed; }
+/* the scene point, its depth and motion vectors: for DLSS and for FSR frame generation (fsr_fg.c) alike */
+static int mv_active(void) { return dl_active() || vk_fsr_fg_active(); }
 
+/* which way the scene's depth runs, from the compares of the draws that write it: near is 1 (GREATER) or 0 (LESS).
+   Settled after 200 votes; SWR_FSR_FG_DEPTH_INVERTED=0/1 overrides */
+static struct {
+    u32 greater, less;
+    int settled, inverted;
+} g_zdir;
+int vk_dlss_depth_inverted(void);
+int vk_dlss_depth_inverted(void) {
+    static int env = -2;
+    if (env == -2) env = getenv("SWR_FSR_FG_DEPTH_INVERTED") ? atoi(getenv("SWR_FSR_FG_DEPTH_INVERTED")) != 0 : -1;
+    if (env >= 0) return env;
+    if (g_zdir.settled) return g_zdir.inverted;
+    int inv = g_zdir.greater > g_zdir.less;
+    if (g_zdir.greater + g_zdir.less >= 200) {
+        g_zdir.settled = 1;
+        g_zdir.inverted = inv;
+        LOG("fsr: scene depth %s (%u GREATER/GEQUAL draws, %u LESS/LEQUAL)\n", inv ? "inverted" : "not inverted",
+            g_zdir.greater, g_zdir.less);
+    }
+    return inv;
+}
+
+/* FSR frame generation's scene depth when DLSS doesn't run on the frame: the depth target the most depth-writing draws
+   wrote, the same one 30 frames in a row before it moves (none for 30 frames: a menu or a video, no generation). Its
+   motion vectors and prepare come at the present (fg_point). The DLSS point above never comes in Metroid Prime 4,
+   measured 2026-11-06 (SWR_DLSS_TRACE): it draws its scene at a dynamic size (1440x808 of a 1600x900 frame) into an
+   R11G11B10F target and upscales that itself into one of another format, so no full-size R11G11B10F pass reads it */
+static struct {
+    u64 gva[8];
+    u32 n[8];
+    int k;
+    u64 stable, chosen;
+    int streak, reset;
+    float vx, vy; /* this frame: the far corner of the scene draws' viewports, in image pixels (the scene's own size,
+                     less than the depth image's at a dynamic resolution) */
+} g_fz;
+
+/* SWR_DLSS_TRACE=1: one frame in 1200 written out pass by pass (where the scene point is looked for) */
+static int g_trace;
+static int trace_on(void) {
+    static int env = -1;
+    if (env < 0) env = getenv("SWR_DLSS_TRACE") != NULL;
+    return env && g_trace;
+}
 static int full_hdr(const Surf* s) {
     return s && (s->fkey & 0xFFFF) == DL_FMT_R11G11B10F && g_dl.scene_w && s->w == g_dl.scene_w && s->h == g_dl.scene_h;
 }
@@ -260,14 +313,31 @@ static int written_now(u64 gva) {
 }
 
 /* render.c, every draw once its pass is open: what it writes, and the pending reads attributed to it */
-void vk_dlss_draw(Surf* rt0, Surf* zt, int depth_test);
-void vk_dlss_draw(Surf* rt0, Surf* zt, int depth_test) {
+void vk_dlss_draw(Surf* rt0, Surf* zt, int depth_test, int depth_cmp);
+void vk_dlss_draw(Surf* rt0, Surf* zt, int depth_test, int depth_cmp) {
     (void)depth_test;
-    if (!dl_active()) return;
+    if (!mv_active()) return;
     if (zt && zt->f.depth && rt0 && rt0->w == zt->w && rt0->h == zt->h && zt->w >= 640) { /* the scene's depth */
         g_dl.last_z = zt->gva;
         g_dl.scene_w = zt->w;
         g_dl.scene_h = zt->h;
+        if (!g_zdir.settled && depth_cmp >= 0) {
+            if (depth_cmp == VK_COMPARE_OP_GREATER || depth_cmp == VK_COMPARE_OP_GREATER_OR_EQUAL) g_zdir.greater++;
+            else if (depth_cmp == VK_COMPARE_OP_LESS || depth_cmp == VK_COMPARE_OP_LESS_OR_EQUAL) g_zdir.less++;
+        }
+    }
+    if (zt && zt->f.depth && depth_cmp >= 0 && zt->w >= 640 && vk_fsr_fg_active()) { /* a depth-writing draw */
+        int i = 0;
+        while (i < g_fz.k && g_fz.gva[i] != zt->gva) i++;
+        if (i == g_fz.k && g_fz.k < 8) {
+            g_fz.gva[g_fz.k] = zt->gva;
+            g_fz.n[g_fz.k++] = 0;
+        }
+        if (i < g_fz.k) g_fz.n[i]++;
+    }
+    if (!dl_active()) {
+        g_dl.nreads = 0;
+        return;
     }
     if (full_hdr(rt0)) {
         if (!written_now(rt0->gva) && g_dl.nwritten < 8) g_dl.written[g_dl.nwritten++] = rt0->gva;
@@ -283,6 +353,10 @@ void vk_dlss_draw(Surf* rt0, Surf* zt, int depth_test) {
 /* render.c, a new render pass: the first small one ends the scene part of the frame */
 void vk_dlss_pass(Surf** rt, u32 n);
 void vk_dlss_pass(Surf** rt, u32 n) {
+    if (trace_on() && n && rt[0])
+        LOG("dlss trace: pass %ux%u (image %ux%u) format %x rt %llx, scene %ux%u%s\n", rt[0]->w, rt[0]->h, rt[0]->sw,
+            rt[0]->sh, rt[0]->fkey, (unsigned long long)rt[0]->gva, g_dl.scene_w, g_dl.scene_h,
+            g_dl.small_seen ? " (small seen)" : "");
     if (!dl_active() || g_dl.small_seen || !n || !rt[0] || !g_dl.scene_w) return;
     if (rt[0]->w * 4 <= g_dl.scene_w) {
         g_dl.small_seen = 1;
@@ -301,7 +375,37 @@ void vk_dlss_pass(Surf** rt, u32 n) {
 /* renderer.c, each game present */
 void vk_dlss_frame(void);
 void vk_dlss_frame(void) {
-    if (!dl_active()) return;
+    if (!mv_active()) return;
+    {
+        static u32 fr;
+        fr++;
+        if (trace_on())
+            LOG("dlss trace: frame: scene %ux%u, written %d, small %d, best %llx, stable %llx, chosen %llx z %llx, "
+                "evaluated %d; frame generation depth %llx (%d targets written)\n", g_dl.scene_w, g_dl.scene_h,
+                g_dl.nwritten, g_dl.small_seen, (unsigned long long)g_dl.frame_best, (unsigned long long)g_dl.stable,
+                (unsigned long long)g_dl.chosen, (unsigned long long)g_dl.chosen_z, g_dl.evaluated,
+                (unsigned long long)g_fz.chosen, g_fz.k);
+        g_trace = fr % 1200 == 599;
+    }
+    fg_point(); /* before the capture buffers swap: this frame's */
+    { /* the next frame's frame generation depth */
+        u64 best = 0;
+        u32 most = 0;
+        for (int i = 0; i < g_fz.k; i++)
+            if (g_fz.n[i] > most) {
+                most = g_fz.n[i];
+                best = g_fz.gva[i];
+            }
+        g_fz.k = 0;
+        if (best == g_fz.stable) g_fz.streak = 0;
+        else if (!g_fz.stable || ++g_fz.streak >= 30) {
+            g_fz.stable = best;
+            g_fz.streak = 0;
+            g_fz.reset = 1;
+        }
+        g_fz.chosen = vk_fsr_fg_active() ? g_fz.stable : 0;
+        g_fz.vx = g_fz.vy = 0;
+    }
     if (g_dl.small_seen && g_dl.frame_best) {
         g_dl.missing = 0;
         if (g_dl.frame_best == g_dl.stable) g_dl.streak = 0;
@@ -369,6 +473,7 @@ static int ensure_images(u32 w, u32 h) {
     g_dl.w = w;
     g_dl.h = h;
     g_dl.reset = 1;
+    g_fz.reset = 1;
     return 1;
 }
 
@@ -454,7 +559,7 @@ static struct {
 } g_mv;
 
 int vk_dlss_xfb_wanted(void);
-int vk_dlss_xfb_wanted(void) { return g_mv.on && snxvk_dlss_mode > 0; }
+int vk_dlss_xfb_wanted(void) { return g_mv.on && (snxvk_dlss_mode > 0 || vk_fsr_fg_wanted()); }
 
 static VkPhysicalDeviceTransformFeedbackFeaturesEXT g_xfb_feat;
 const void* vk_dlss_device_chain(const void* next);
@@ -520,8 +625,12 @@ void vk_dlss_draw_begin(void) { g_mv.reads_rt = 0; g_dl.nreads = 0; } /* reads b
 void vk_dlss_rt_read(void);
 void vk_dlss_rt_read(void) { g_mv.reads_rt = 1; }
 
+/* a draw of the scene's depth, whose positions make the motion vectors: DLSS's scene once it has one, else frame
+   generation's (g_fz) */
 static int scene_draw(Surf* zt) {
-    return dl_active() && g_dl.chosen && !g_dl.done && zt && zt->gva == g_dl.chosen_z;
+    if (!zt) return 0;
+    if (dl_active() && g_dl.chosen) return !g_dl.done && zt->gva == g_dl.chosen_z;
+    return g_fz.chosen && zt->gva == g_fz.chosen && vk_fsr_fg_active();
 }
 
 /* render.c, before the viewport is set: scene geometry moves by the frame's jitter. Draws that write depth or test it
@@ -529,8 +638,13 @@ static int scene_draw(Surf* zt) {
    (deferred lighting and screen-space passes, which sample by screen position) */
 void vk_dlss_jitter(Surf* zt, int depth_write, int depth_equal, VkViewport* vp);
 void vk_dlss_jitter(Surf* zt, int depth_write, int depth_equal, VkViewport* vp) {
+    if (depth_write && !dl_active() && scene_draw(zt)) { /* frame generation's scene size */
+        float x = vp->x + vp->width, y = vp->height < 0 ? vp->y : vp->y + vp->height;
+        if (x > g_fz.vx) g_fz.vx = x;
+        if (y > g_fz.vy) g_fz.vy = y;
+    }
     { static int nj = -1; if (nj < 0) nj = getenv("SWR_DLSS_NO_JITTER") != NULL; /* once: this runs at every draw */
-      if (!scene_draw(zt) || nj) return; }
+      if (!dl_active() || !scene_draw(zt) || nj) return; } /* frame generation alone: no jitter */
     { static int all = -1; if (all < 0) all = getenv("SWR_DLSS_JITTER_ALL") != NULL;
       if (!all && !depth_write && !depth_equal && g_mv.reads_rt) return; }
     if (!g_mv.jit_ok) return;
@@ -711,16 +825,23 @@ static void mv_frame(int evaluated) {
     g_mv.jit_used = 0;
 }
 
-static void evaluate(Surf* t, Surf* z) {
+/* at the scene point: the motion vectors, then DLSS (when on) and FSR frame generation's prepare (when on).
+   1 = DLSS ran on this frame */
+static int evaluate(Surf* t, Surf* z) {
     u32 w = t->sw, h = t->sh;
+    int dl = dl_active();
     vk_render_end();
-    if (!ensure_images(w, h)) return dl_fail("image creation", 0);
-    VkImageView zv = depth_view(z);
-    if (!zv) return dl_fail("depth view", 0);
-    VkCommandBuffer cb = vk_cmd();
-    if (!g_dl.params && !NGX_OK(g_ngx.alloc_params(&g_dl.params))) return dl_fail("parameter allocation", 0);
-    NgxParam* p = g_dl.params;
-    if (!g_dl.feat || g_dl.fw != w || g_dl.fh != h) {
+    if (!ensure_images(w, h)) {
+        if (dl) dl_fail("image creation", 0);
+        return 0;
+    }
+    VkImageView zv = VK_NULL_HANDLE;
+    NgxParam* p = NULL;
+    if (dl && !(zv = depth_view(z))) dl = (dl_fail("depth view", 0), 0);
+    if (dl && !g_dl.params && !NGX_OK(g_ngx.alloc_params(&g_dl.params))) dl = (dl_fail("parameter allocation", 0), 0);
+    if (dl) p = g_dl.params;
+    VkCommandBuffer cb;
+    if (dl && (!g_dl.feat || g_dl.fw != w || g_dl.fh != h)) {
         if (g_dl.feat) {
             vk_finish();
             g_ngx.release(g_dl.feat);
@@ -742,15 +863,20 @@ static void evaluate(Surf* t, Surf* z) {
         }
         cb = vk_cmd();
         NgxResult r = g_ngx.create(cb, NGX_FEATURE_SUPERSAMPLING, p, &g_dl.feat);
-        if (!NGX_OK(r) || !g_dl.feat) return dl_fail("feature creation", r);
-        g_dl.fw = w;
-        g_dl.fh = h;
-        g_dl.reset = 1;
-        LOG("dlss: DLSS feature %ux%u created (quality value %d)\n", w, h, quality_value());
+        if (!NGX_OK(r) || !g_dl.feat) {
+            dl_fail("feature creation", r);
+            dl = 0;
+        } else {
+            g_dl.fw = w;
+            g_dl.fh = h;
+            g_dl.reset = 1;
+            LOG("dlss: DLSS feature %ux%u created (quality value %d)\n", w, h, quality_value());
+        }
     }
     cb = vk_cmd();
     /* inputs readable by compute, the output writable */
-    vk_surf_use(cb, t, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+    if (dl)
+        vk_surf_use(cb, t, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
     vk_surf_use(cb, z, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
     vk_barrier(cb, g_dl.mv, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED,
                VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -773,71 +899,122 @@ static void evaluate(Surf* t, Surf* z) {
                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                    VK_ACCESS_2_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL);
     }
-    vk_barrier(cb, g_dl.out, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED,
-               VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL);
-    NgxResourceVK rc = res_image(t->att, t->img, t->f.vk, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
-    NgxResourceVK ro = res_image(g_dl.out_view, g_dl.out, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 1);
-    NgxResourceVK rz = res_image(zv, z->img, z->f.vk, w, h, VK_IMAGE_ASPECT_DEPTH_BIT, 0);
-    NgxResourceVK rm = res_image(g_dl.mv_view, g_dl.mv, VK_FORMAT_R16G16_SFLOAT, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
-    p_setp(p, "Color", &rc);
-    p_setp(p, "Output", &ro);
-    p_setp(p, "Depth", &rz);
-    p_setp(p, "MotionVectors", &rm);
-    { /* the jitter the scene was drawn with; SWR_DLSS_JSIGN=-1 flips its sign (convention check) */
-        float js = getenv("SWR_DLSS_JSIGN") ? (float)atof(getenv("SWR_DLSS_JSIGN")) : 1.0f, sx = js, sy = js;
-        if (getenv("SWR_DLSS_JSCALE")) sscanf(getenv("SWR_DLSS_JSCALE"), "%f,%f", &sx, &sy); /* per axis (test) */
-        int jit = !getenv("SWR_DLSS_NO_JITTER") && g_mv.jit_used;
-        p_setf(p, "Jitter.Offset.X", jit ? sx * g_mv.jx : 0.0f);
-        p_setf(p, "Jitter.Offset.Y", jit ? sy * g_mv.jy : 0.0f);
-    }
-    p_setf(p, "Sharpness", 0.0f);
-    p_seti(p, "Reset", g_dl.reset);
-    { /* render pixels; SWR_DLSS_MVSCALE=x,y overrides (convention check) */
-        float mx = 1.0f, my = 1.0f;
-        const char* e = getenv("SWR_DLSS_MVSCALE");
-        if (e) sscanf(e, "%f,%f", &mx, &my);
-        p_setf(p, "MV.Scale.X", mx);
-        p_setf(p, "MV.Scale.Y", my);
-    }
-    p_setu(p, "DLSS.Render.Subrect.Dimensions.Width", w);
-    p_setu(p, "DLSS.Render.Subrect.Dimensions.Height", h);
-    p_setf(p, "DLSS.Pre.Exposure", 1.0f);
-    p_setf(p, "DLSS.Exposure.Scale", 1.0f);
-    p_setf(p, "FrameTimeDeltaInMsec", 16.67f);
-    NgxResult r = g_ngx.evaluate(cb, g_dl.feat, p, NULL);
-    if (!NGX_OK(r)) return dl_fail("evaluation", r);
-    g_dl.reset = 0;
-    /* the result back into the scene target, which everything after reads */
-    vk_barrier(cb, g_dl.out, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-               VK_ACCESS_2_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-               VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    vk_surf_use(cb, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                VK_ACCESS_2_TRANSFER_WRITE_BIT);
-    VkImageBlit b = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                     .srcOffsets = {{0, 0, 0}, {(i32)w, (i32)h, 1}},
-                     .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
-                     .dstOffsets = {{0, 0, 0}, {(i32)w, (i32)h, 1}}};
-    static int debug_mv = -1;
-    if (debug_mv < 0) debug_mv = getenv("SWR_DLSS_DEBUG_MV") != NULL;
-    if (debug_mv) { /* test: the motion vectors themselves in place of the scene (R = x, G = y, render pixels) */
-        vk_barrier(cb, g_dl.mv, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                   VK_ACCESS_2_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+    if (dl) {
+        vk_barrier(cb, g_dl.out, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED,
+                   VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        NgxResourceVK rc = res_image(t->att, t->img, t->f.vk, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
+        NgxResourceVK ro = res_image(g_dl.out_view, g_dl.out, VK_FORMAT_R16G16B16A16_SFLOAT, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 1);
+        NgxResourceVK rz = res_image(zv, z->img, z->f.vk, w, h, VK_IMAGE_ASPECT_DEPTH_BIT, 0);
+        NgxResourceVK rm = res_image(g_dl.mv_view, g_dl.mv, VK_FORMAT_R16G16_SFLOAT, w, h, VK_IMAGE_ASPECT_COLOR_BIT, 0);
+        p_setp(p, "Color", &rc);
+        p_setp(p, "Output", &ro);
+        p_setp(p, "Depth", &rz);
+        p_setp(p, "MotionVectors", &rm);
+        { /* the jitter the scene was drawn with; SWR_DLSS_JSIGN=-1 flips its sign (convention check) */
+            float js = getenv("SWR_DLSS_JSIGN") ? (float)atof(getenv("SWR_DLSS_JSIGN")) : 1.0f, sx = js, sy = js;
+            if (getenv("SWR_DLSS_JSCALE")) sscanf(getenv("SWR_DLSS_JSCALE"), "%f,%f", &sx, &sy); /* per axis (test) */
+            int jit = !getenv("SWR_DLSS_NO_JITTER") && g_mv.jit_used;
+            p_setf(p, "Jitter.Offset.X", jit ? sx * g_mv.jx : 0.0f);
+            p_setf(p, "Jitter.Offset.Y", jit ? sy * g_mv.jy : 0.0f);
+        }
+        p_setf(p, "Sharpness", 0.0f);
+        p_seti(p, "Reset", g_dl.reset);
+        { /* render pixels; SWR_DLSS_MVSCALE=x,y overrides (convention check) */
+            float mx = 1.0f, my = 1.0f;
+            const char* e = getenv("SWR_DLSS_MVSCALE");
+            if (e) sscanf(e, "%f,%f", &mx, &my);
+            p_setf(p, "MV.Scale.X", mx);
+            p_setf(p, "MV.Scale.Y", my);
+        }
+        p_setu(p, "DLSS.Render.Subrect.Dimensions.Width", w);
+        p_setu(p, "DLSS.Render.Subrect.Dimensions.Height", h);
+        p_setf(p, "DLSS.Pre.Exposure", 1.0f);
+        p_setf(p, "DLSS.Exposure.Scale", 1.0f);
+        p_setf(p, "FrameTimeDeltaInMsec", 16.67f);
+        NgxResult r = g_ngx.evaluate(cb, g_dl.feat, p, NULL);
+        if (!NGX_OK(r)) {
+            dl_fail("evaluation", r);
+            vk_render_forget_state();
+            return 0;
+        }
+        /* the result back into the scene target, which everything after reads */
+        vk_barrier(cb, g_dl.out, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                   VK_ACCESS_2_SHADER_WRITE_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
                    VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-        vkCmdBlitImage(cb, g_dl.mv, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                       &b, VK_FILTER_NEAREST);
-    } else
-        vkCmdBlitImage(cb, g_dl.out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
-                       &b, VK_FILTER_NEAREST);
-    t->wgen++;
-    vk_rt_drawn(t);
-    /* the motion-vector pass (and NGX) bound pipelines and state of their own in this command buffer: the next draw
-       sets all of its own again. Without this the draws after DLSS kept the replay pass's pipeline and viewport and
-       wrote nothing, so the scene held its old picture while the HUD moved on (2026-10-22) */
+        vk_surf_use(cb, t, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                    VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        VkImageBlit b = {.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                         .srcOffsets = {{0, 0, 0}, {(i32)w, (i32)h, 1}},
+                         .dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1},
+                         .dstOffsets = {{0, 0, 0}, {(i32)w, (i32)h, 1}}};
+        static int debug_mv = -1;
+        if (debug_mv < 0) debug_mv = getenv("SWR_DLSS_DEBUG_MV") != NULL;
+        if (debug_mv) { /* test: the motion vectors themselves in place of the scene (R = x, G = y, render pixels) */
+            vk_barrier(cb, g_dl.mv, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                       VK_ACCESS_2_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                       VK_ACCESS_2_TRANSFER_READ_BIT, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+            vkCmdBlitImage(cb, g_dl.mv, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                           &b, VK_FILTER_NEAREST);
+        } else
+            vkCmdBlitImage(cb, g_dl.out, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, t->img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                           &b, VK_FILTER_NEAREST);
+        t->wgen++;
+        vk_rt_drawn(t);
+        if (++g_dl.evals == 1 || g_dl.evals % 600 == 0)
+            LOG("dlss: %d frames (scene %llx %ux%u, depth %llx); motion vectors from %u of %u captured draws, jitter %.3f %.3f; %d target switches, %d unjittered-safety holds\n",
+                g_dl.evals, (unsigned long long)t->gva, w, h, (unsigned long long)z->gva, mv_draws > 1 ? mv_draws : 0,
+                g_mv.nrec[g_mv.cur], g_mv.jx, g_mv.jy, g_dl.switches, g_mv.misses);
+    }
+    { /* FSR frame generation's prepare, on this frame's depth and motion vectors (fsr_fg.c) */
+        int jit = !getenv("SWR_DLSS_NO_JITTER") && g_mv.jit_used;
+        vk_fsr_fg_scene(z, g_dl.mv, w, h, w, h, jit ? g_mv.jx : 0.0f, jit ? g_mv.jy : 0.0f, g_dl.reset || g_fz.reset);
+    }
+    g_dl.reset = 0;
+    g_fz.reset = 0;
+    /* the motion-vector pass, NGX and FidelityFX bound pipelines and state of their own in this command buffer: the
+       next draw sets all of its own again. Without this the draws after DLSS kept the replay pass's pipeline and
+       viewport and wrote nothing, so the scene held its old picture while the HUD moved on (2026-10-22) */
     vk_render_forget_state();
-    if (++g_dl.evals == 1 || g_dl.evals % 600 == 0)
-        LOG("dlss: %d frames (scene %llx %ux%u, depth %llx); motion vectors from %u of %u captured draws, jitter %.3f %.3f; %d target switches, %d unjittered-safety holds\n",
-            g_dl.evals, (unsigned long long)t->gva, w, h, (unsigned long long)z->gva, mv_draws > 1 ? mv_draws : 0,
-            g_mv.nrec[g_mv.cur], g_mv.jx, g_mv.jy, g_dl.switches, g_mv.misses);
+    return dl;
+}
+
+/* the present, DLSS not run on the frame: frame generation's motion vectors on its depth (g_fz), and its prepare,
+   recorded after the frame's own commands and ahead of the present. No jitter: the scene is drawn as the game drew it */
+static void fg_point(void) {
+    if (!vk_fsr_fg_active() || g_dl.evaluated || !g_fz.chosen) return;
+    Surf* z = vk_rt_find(g_fz.chosen);
+    if (!z || !z->f.depth) return;
+    u32 w = z->sw, h = z->sh;
+    vk_render_end();
+    if (!ensure_images(w, h)) return;
+    VkCommandBuffer cb = vk_cmd();
+    vk_surf_use(cb, z, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+    vk_barrier(cb, g_dl.mv, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0, VK_IMAGE_LAYOUT_UNDEFINED,
+               VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkClearColorValue zero = {{0, 0, 0, 0}};
+    VkImageSubresourceRange all = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cb, g_dl.mv, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &all);
+    u32 drawn = getenv("SWR_DLSS_NO_MV") ? 0 : mv_pass(cb, z, w, h);
+    if (!drawn)
+        vk_barrier(cb, g_dl.mv, VK_IMAGE_ASPECT_COLOR_BIT, VK_PIPELINE_STAGE_2_TRANSFER_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                   VK_ACCESS_2_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL);
+    else /* the pass read the depth as an attachment: back to compute reads */
+        vk_surf_use(cb, z, VK_IMAGE_LAYOUT_GENERAL, VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT, VK_ACCESS_2_SHADER_READ_BIT);
+    /* the part of the depth image the scene covers: at a dynamic resolution the game draws its scene into the top-left
+       of its targets and scales it up to the frame itself, so depth and motion vectors map to the picture from there */
+    static int full = -1;
+    if (full < 0) full = getenv("SWR_FSR_FG_FULL_RECT") != NULL;
+    u32 rw = (u32)(g_fz.vx + 0.5f), rh = (u32)(g_fz.vy + 0.5f);
+    if (full || !rw || !rh || rw > w || rh > h) rw = w, rh = h;
+    vk_fsr_fg_scene(z, g_dl.mv, w, h, rw, rh, 0.0f, 0.0f, g_fz.reset);
+    g_fz.reset = 0;
+    vk_render_forget_state(); /* the motion-vector pass and FidelityFX bound state of their own */
+    static u32 n;
+    if (++n == 1 || n % 600 == 0)
+        LOG("fsr: depth %llx %ux%u (image %ux%u), scene %ux%u (viewports to %.1f x %.1f), motion vectors from %u of %u "
+            "captured draws\n", (unsigned long long)z->gva, z->w, z->h, w, h, rw, rh, g_fz.vx, g_fz.vy,
+            drawn > 1 ? drawn : 0, g_mv.nrec[g_mv.cur]);
 }
 
 /* texture.c, before a texture over a render target takes its pixels */
@@ -846,6 +1023,9 @@ void vk_dlss_before_read(u64 gva) {
     if (!dl_active()) return;
     Surf* r = vk_rt_find(gva);
     if (!r) return;
+    if (trace_on())
+        LOG("dlss trace:   read %llx %ux%u format %x%s\n", (unsigned long long)gva, r->w, r->h, r->fkey,
+            full_hdr(r) ? " (full-size HDR)" : "");
     if (g_dl.chosen && !g_dl.done) g_mv.reads_rt = 1;
     if (full_hdr(r) && g_dl.nreads < 16) {
         int dup = 0;
@@ -856,6 +1036,5 @@ void vk_dlss_before_read(u64 gva) {
     g_dl.done = 1;
     Surf* z = g_dl.chosen_z ? vk_rt_find(g_dl.chosen_z) : NULL;
     if (!z || !z->f.depth || r->sw != z->sw || r->sh != z->sh) return;
-    evaluate(r, z);
-    g_dl.evaluated = 1;
+    g_dl.evaluated = evaluate(r, z);
 }

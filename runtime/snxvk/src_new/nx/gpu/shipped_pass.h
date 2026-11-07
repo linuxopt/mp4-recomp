@@ -5,24 +5,27 @@
    thread, and hands each program to the renderer, which translates and keeps it (gpu/vk/pipeline.c), through a
    ShipSink. What was read is kept by the sink as SHIP_FILE records (a file or segment, by its name, place, size and
    first bytes) and a SHIP_ALL record (every one, by the RomFS's table and the segments), so a later run reads only
-   what it hasn't */
+   what it hasn't. Those are of one build and driver, whose translations the sink keeps with them. A RomFS file the
+   walk finds no programs in is a SHIP_NONE record, by its name, place and size alone, which the sink keeps across
+   builds and drivers under the walk's own version (ship_walk_version): after an update, the walk reads again only
+   the files that hold programs, instead of every file (one game's 51,000 of them took 26 s, read one at a time) */
 #ifndef SNX_SHIPPED_PASS_H
 #define SNX_SHIPPED_PASS_H
 #include "common/cpu/aarch64/cpu.h"
 #include <stddef.h>
 
-enum { SHIP_FILE = 1, SHIP_ALL = 2 }; /* what a scan record says was read */
+enum { SHIP_FILE = 1, SHIP_ALL = 2, SHIP_NONE = 3 }; /* what a scan record says was read */
 /* what the sink did with a program */
 enum { SHIP_NEW, SHIP_KNOWN, SHIP_SKIPPED, SHIP_FAILED, SHIP_LACKED, SHIP_STOP };
 typedef struct {
     void* ctx;
     int (*scanned)(void* ctx, u32 what, u64 id); /* read by an earlier run */
     void (*mark)(void* ctx, u32 what, u64 id);   /* read now, for the next run */
-    /* a program: its SPH, the bytes from there to the end of what holds it, and its stage (shipped_sph_stage's,
-       SHIPPED_VERTEX_A included). SHIP_NEW, SHIP_KNOWN (translated before), SHIP_SKIPPED (no draw would find it),
+    /* a program: its SPH, the bytes from there to the end of what holds it, its stage (shipped_sph_stage's,
+       SHIPPED_VERTEX_A included), and its constants (shipped_programs', NULL and 0 when unknown). SHIP_NEW, SHIP_KNOWN (translated before), SHIP_SKIPPED (no draw would find it),
        SHIP_FAILED (its translation failed, as it will on every run of this build and driver), SHIP_LACKED (not
        handled for want of memory, for a later run to try again), or SHIP_STOP once the walk is to end */
-    int (*program)(void* ctx, const u8* sph, size_t avail, int stage);
+    int (*program)(void* ctx, const u8* sph, size_t avail, int stage, const u8* consts, size_t nconsts);
     int (*stopped)(void* ctx);
     /* a line of the walk, for the log, and for the screen when shown (the screen's in a player's words, the log's
        with the stages and the failures) */
@@ -34,6 +37,9 @@ typedef struct {
     u32 files, files_seen, programs, programs_done;
 } ShipProgress;
 
+/* what the walk finds in a file's bytes, as a version: the hash of its sources (shipped.c, shipped_pass.c and their
+   headers), which the build hands it. The key of the SHIP_NONE records, which a change of what it finds starts over */
+const char* ship_walk_version(void);
 /* the executables' writable segments copied, on the main thread before the game's first thread runs, so the walk
    reads them as they were loaded (the read-only ones it reads in place) */
 void ship_snapshot(void);

@@ -2,10 +2,10 @@
 
   make_release.py release OUT_DIR --version X.Y.Z [--exe PATH]   -> OUT_DIR\\Metroid Prime 4 Beyond\\ (the game EXE + recompiler + licences) and a .zip
   make_release.py source  OUT_DIR                -> a clean source tree for GitHub (no game files, no generated code, no binaries
-                                                    we don't have the right to publish, no DLSS)
+                                                    we don't have the right to publish, no NVIDIA DLSS files)
 
-The release EXE is built with SWR_RELEASE=1 (no DLSS, no frame generation): python\\python.exe switchrecomp.py --build-runtime
---cc gcc with SWR_RELEASE=1 set, after work-profiler\\build_imgui.py and SWR_NO_DLSS=1 work-profiler\\build_snxvk.py.
+The release EXE is built with SWR_RELEASE=1 (no frame generation): python\\python.exe switchrecomp.py --build-runtime
+--cc gcc with SWR_RELEASE=1 set, after work-profiler\\build_imgui.py and work-profiler\\build_snxvk2.py.
 Nothing from Nintendo is copied: setup compiles the player's own files on their PC.
 """
 import os, sys, shutil, zipfile, hashlib, fnmatch, time, subprocess
@@ -13,7 +13,7 @@ import os, sys, shutil, zipfile, hashlib, fnmatch, time, subprocess
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GCC = os.path.join(ROOT, 'gcc', 'Library')
 GV = '14.2.0'; TRIPLE = 'x86_64-w64-mingw32'
-RECOMPILER_PY = ['switchrecomp.py', 'codegen.py', 'a64.py', 'nxloader.py', 'metroid_perf.py']
+RECOMPILER_PY = ['switchrecomp.py', 'codegen.py', 'a64.py', 'nxloader.py', 'metroid_perf.py', 'logic_rate.py', 'mouse_aim.py']
 
 
 def cp(src, dst):
@@ -85,7 +85,8 @@ setup compiles it on your PC. No Nintendo files, keys or firmware are included.
    In the game, F1 (or the Home / Guide button) opens the menu; most settings change right away.
 
 Controllers: Xbox controllers work as they are; SDL2.dll (included) adds Switch Pro, Joy-Con, DualShock 4, DualSense
-and 8BitDo over USB or Bluetooth. Keyboard: arrows = D-pad, WASD = stick, X/Z/C/V = A/B/X/Y, Enter = +, Backspace = -.
+and 8BitDo over USB or Bluetooth. Keyboard and mouse follow PrimeHack: WASD move, mouse aims, left click fires,
+right click or Shift locks on, Space jumps, Ctrl morphs, E visors, 1-4 weapons. F1 > Controls rebinds any key.
 
 Built on the recompiled runtime by yozander2009-stack, with Claude by Anthropic (AI pair programmer).
 Credits: SwitchRecomp by MZ Labs (recompiler and runtime); ScarletNX (native Vulkan renderer); Krydar, Nova77, xSeRosiSx (button-icon mods, downloaded on request; art: Xelu's FREE Controller Prompts); program icon: Metroid icon created by Smashicons - Flaticon (https://www.flaticon.com/free-icons/metroid); Dear ImGui; SDL2; zlib; libvpx; OpenH264; GCC / MinGW-w64; Python. Licences are in the licenses folder; the EXE is
@@ -149,8 +150,9 @@ def release(out, exe, version):
     for f in RECOMPILER_PY:
         cp(os.path.join(ROOT, f), os.path.join(rc, f))
     cp(os.path.join(ROOT, 'beyond', 'beyond_setup.py'), os.path.join(rc, 'beyond_setup.py'))
-    for f in ('beyond_patches.json', 'romfs_beyond.manifest'):
-        cp(os.path.join(ROOT, 'beyond', f), os.path.join(rc, 'beyond', f))
+    cp(os.path.join(ROOT, 'beyond', 'romfs_beyond.manifest'), os.path.join(rc, 'beyond', 'romfs_beyond.manifest'))
+    if os.path.isfile(os.path.join(ROOT, 'beyond', 'beyond_patches.json')):   # optional: setup compiles the code as translated without it
+        cp(os.path.join(ROOT, 'beyond', 'beyond_patches.json'), os.path.join(rc, 'beyond', 'beyond_patches.json'))
     for f in ('cpu.h', 'cpu_helpers.c'):
         cp(os.path.join(ROOT, 'runtime', f), os.path.join(rc, 'runtime', f))
     cptree(os.path.join(ROOT, 'python'), os.path.join(rc, 'python'), ignore=shutil.ignore_patterns('__pycache__'))
@@ -245,6 +247,8 @@ def source(out):
         if os.path.isfile(os.path.join(ROOT, rel)):
             cp(os.path.join(ROOT, rel), os.path.join(out, rel))
     for f in ('beyond_setup.py', 'make_release.py', 'make_patches.py', 'make_manifest.py', 'beyond_patches.json', 'romfs_beyond.manifest', 'DESIGN.md'):
+        if f in ('beyond_patches.json', 'DESIGN.md') and not os.path.isfile(os.path.join(ROOT, 'beyond', f)):
+            continue   # optional, not in every checkout
         cp(os.path.join(ROOT, 'beyond', f), os.path.join(out, 'beyond', f))
     im = os.path.join(ROOT, 'third_party', 'imgui-1.92.5')
     for f in ('imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp', 'imgui.h', 'imconfig.h', 'imgui_internal.h',
@@ -305,7 +309,7 @@ the game with a bundled GCC, a Play / settings screen, and an in-game menu (F1 o
 
 | path | what |
 |---|---|
-| `switchrecomp.py`, `codegen.py`, `a64.py`, `nxloader.py`, `metroid_perf.py` | SwitchRecomp: ARM64 → C translator (Apache-2.0) |
+| `switchrecomp.py`, `codegen.py`, `a64.py`, `nxloader.py`, `metroid_perf.py`, `logic_rate.py`, `mouse_aim.py` | SwitchRecomp: ARM64 → C translator (Apache-2.0) |
 | `runtime/` | the runtime: kernel, services, GPU → OpenGL, audio, video, input |
 | `runtime/beyond_ui/` | front end: `fe.cpp` (setup, Play, settings), `ov.cpp` (in-game menu), `ui.cpp` (theme, widgets, settings table) |
 | `runtime/snxvk/` | ScarletNX's native Vulkan renderer (GPL-3.0, main b5f4f14) in `src_new/`, vendored, symbols prefixed `snxv_`; our DLSS code in `src_new/nx/gpu/vk/dlss.c` |
@@ -356,7 +360,7 @@ The release zip bundles the same GCC and Python so that setup can compile the ga
 
 ```
 python\\python.exe work-profiler\\build_imgui.py
-set GLSLANG=<path to glslang.exe 16.6.0> && set SWR_NO_DLSS=1 && python\\python.exe work-profiler\\build_snxvk2.py
+set GLSLANG=<path to glslang.exe 16.6.0> && python\\python.exe work-profiler\\build_snxvk2.py
 set SWR_RELEASE=1 && python\\python.exe switchrecomp.py --build-runtime --cc gcc
 python\\python.exe beyond\\make_release.py release <empty folder> --version X.Y.Z --exe bin\\runtime_win64_win32.exe
 ```
@@ -437,7 +441,9 @@ Each source file keeps its own licence; Apache-2.0 and MIT code is GPL-3.0-compa
 - libvpx and OpenH264: BSD.
 - SDL2 and zlib: zlib licence.
 
-NVIDIA DLAA: the code is here (`dlss.c`), NVIDIA's files are not, and the release is built without it. A build with DLSS is for your own use only: never share it.
+NVIDIA DLAA: the code is here (`dlss.c`). NVIDIA's files are not: the Graphics page downloads `nvngx_dlss.dll` from NVIDIA's GitHub (version 310.9.16, checked by size and SHA-256) for RTX cards, under NVIDIA's license.
+
+AMD FSR frame generation: the headers are in `runtime/snxvk/deps/FidelityFX-SDK-2.4.0` (MIT). AMD's signed DLLs are not: the Graphics page downloads them from AMD's FidelityFX SDK on GitHub (version 2.4.0, checked by size and SHA-256), under AMD's license.
 
 Metroid Prime 4 Beyond is © Nintendo. This project is not affiliated with or endorsed by Nintendo.
 """

@@ -9,6 +9,7 @@
    GPU-side writes the renderer's caches check */
 #include "nx/gpu/maxwell/engines_int.h"
 #include "nx/gpu/maxwell/write_pages.h"
+#include "nx/gpu/maxwell/draw_state.h"
 #include "nx/hle/services/nvdrv.h"
 
 /* ------------------------------------------------------------ the record of GPU-side writes */
@@ -20,19 +21,18 @@
    reads as written after anything asked before. Exact per page: a texture is dirty only when a write touched one of
    its own pages. Writers take the lock, readers don't (gpu_mem_dirty_since); the generation is published with
    release order for those reads.
-   SNX_ALIAS_CHECK keeps the guest-address table as well and has gpu_mem_dirty_since answer the old way too,
+   gpu_page_check=1 keeps the guest-address table as well and has gpu_mem_dirty_since answer the old way too,
    translating the range, warning when only that way finds a write */
 static PMutex g_wlk = PMUTEX_INIT;
 static WritePages g_wgpu, g_wcpu;
 static u64 g_wgen;
-static int g_wcheck = -1; /* SNX_ALIAS_CHECK, -1 until read */
+static int g_wcheck = -1; /* gpu_page_check, -1 until read */
 static int wcheck_on(void) {
     int c = __atomic_load_n(&g_wcheck, __ATOMIC_RELAXED);
     if (c < 0) { /* threads reading it at once all read the same */
-        const char* e = getenv("SNX_ALIAS_CHECK");
-        c = e && *e && *e != '0';
+        c = g_settings.gpu_page_check != 0;
         if (__atomic_exchange_n(&g_wcheck, c, __ATOMIC_RELAXED) < 0 && c)
-            LOG("gpu: SNX_ALIAS_CHECK: GPU-side writes are checked through the GMMU too\n");
+            LOG("gpu: gpu_page_check=1: GPU-side writes are checked through the GMMU too\n");
     }
     return c;
 }
@@ -50,8 +50,13 @@ static void guest_runs(u64 gva, u64 size, int (*fn)(u64 cpu, u64 n, void* ctx), 
     }
 }
 static void stamp_alias(void* ctx, u64 gva, u64 n) { write_pages_stamp(&g_wgpu, gva, n, *(const u64*)ctx); }
+/* the renderer's watch on GPU-side writes (gpu_set_write_watch): any thread, under g_wlk */
+static void (*g_wwatch)(u64 cpu, u64 n);
+void gpu_set_write_watch(void (*fn)(u64 cpu, u64 n)) { __atomic_store_n(&g_wwatch, fn, __ATOMIC_RELEASE); }
 /* guest memory written: the GPU pages showing it */
 static void stamp_cpu(u64 cpu, u64 n, u64 gen) {
+    void (*watch)(u64, u64) = __atomic_load_n(&g_wwatch, __ATOMIC_ACQUIRE);
+    if (watch) watch(cpu, n);
     gmmu_aliases(cpu, n, stamp_alias, &gen);
     if (wcheck_on()) write_pages_stamp(&g_wcpu, cpu, n, gen);
 }
@@ -80,6 +85,17 @@ void gpu_mem_written_cpu(u64 cpu, u64 size) {
     pm_unlock(&g_wlk);
 }
 u64 gpu_mem_generation(void) { return __atomic_load_n(&g_wgen, __ATOMIC_ACQUIRE); }
+/* a save state's load: every page reads as written after anything asked before, through the tables' overflow, which
+   covers every page */
+void gpu_mem_written_all(void) {
+    u64 gen;
+    pm_lock(&g_wlk);
+    gen = g_wgen + 1;
+    __atomic_store_n(&g_wgpu.overflow, gen, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_wcpu.overflow, gen, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_wgen, gen, __ATOMIC_RELEASE);
+    pm_unlock(&g_wlk);
+}
 typedef struct {
     u64 since;
     int dirty;
@@ -107,6 +123,10 @@ int gpu_mem_dirty_since(u64 since, u64 a, u64 sz) {
     return q.dirty;
 }
 
+void gpu_mem_dirty_runs(u64 since, u64 a, u64 sz, void (*fn)(void* ctx, u64 at, u64 n), void* ctx) {
+    if (sz && since < __atomic_load_n(&g_wgen, __ATOMIC_ACQUIRE)) write_pages_runs(&g_wgpu, since, a, sz, fn, ctx);
+}
+
 /* ------------------------------------------------------------ draws and clears */
 /* the separate topology (0x652 bit 0, PrimitiveTopologyControl UseSeparateState) and its override enum (0x65C) as
    the draw's topology: points and lines are numbered one past the draw's enum, the legacy values by name */
@@ -130,10 +150,36 @@ static u32 topology_of(const u32* r, u32 topology) {
     }
 }
 
+/* draw_state_check=1: each draw's state, kept from the register groups, is compared with its registers read again */
+static int dirty_check(void) {
+    static int on = -1;
+    if (on < 0) on = g_settings.draw_state_check != 0;
+    return on;
+}
+void (*g_gpu_verify_draw)(GpuChannel* ch, const DrawCall* dc);
+void (*g_gpu_verify_cb)(u64 gva, const u32* words, u32 n);
 void r3d_draw(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count, u32 base_vertex, u32 base_instance,
               u32 instances) {
-    if (ch->render_off || !g_renderer->draw) return;
-    g_renderer->draw(ch, indexed, topology_of(ch->r3d, topology), first, count, base_vertex, base_instance, instances);
+    int verify = gpu_channel_verify(ch);
+    if (ch->render_off || (!verify && !g_renderer->draw)) return;
+    mx_draw_state_sync(ch);
+    if (dirty_check()) {
+        u32 stale = mx_draw_state_stale(ch);
+        if (stale)
+            WARN_LIMIT(32, "gpu: draw_state_check=1: the draw state's groups %x differ from the registers\n", stale);
+    }
+    DrawCall dc = {.topology = topology_of(ch->r3d, topology),
+                   .indexed = (u32)indexed,
+                   .first = first,
+                   .count = count,
+                   .base_vertex = base_vertex,
+                   .base_instance = base_instance,
+                   .instances = instances,
+                   .inline_indices = ch->inline_indices};
+    if (verify)
+        g_gpu_verify_draw(ch, &dc);
+    else
+        g_renderer->draw(&ch->ds, &dc, &ch->owner);
 }
 /* guest memory without the renderer's hooks: only for the clear below, made while no renderer runs */
 static void raw_write(u64 gva, const u8* src, u32 n) {
@@ -196,12 +242,25 @@ void r3d_clear(GpuChannel* ch, u32 v) {
     if (ch->render_off) return;
     if (!g_renderer_up)
         clear_in_memory(ch, v);
-    else if (g_renderer->clear)
-        g_renderer->clear(ch, v);
+    else if (g_renderer->clear) {
+        /* the slot is taken through RT_CONTROL's count and permutation, like draws do. Whether the hardware takes the
+           target registers of that index directly isn't settled: the first clear where the two differ is logged */
+        u32 ctl = ch->r3d[0x487], slot = (v >> 6) & 15;
+        if (((v >> 2) & 15) && (slot >= (ctl & 15) || ((ctl >> (4 + slot * 3)) & 7) != slot))
+            LOG_LIMIT(1, "vulkan: a clear of color slot %u under RT_CONTROL %08x\n", slot, ctl);
+        DrawClear c;
+        mx_draw_state_sync(ch);
+        mx_draw_clear(ch->r3d, v, &c);
+        g_renderer->clear(&ch->ds, &c, &ch->owner);
+    }
 }
 /* DRAW_TEXTURE: not gated by the render enable here, the renderer reads its registers as Eden does */
 void r3d_draw_texture(GpuChannel* ch) {
-    if (g_renderer->draw_texture) g_renderer->draw_texture(ch);
+    if (!g_renderer->draw_texture || gpu_channel_verify(ch)) return;
+    DrawTexture t;
+    mx_draw_state_sync(ch);
+    mx_draw_texture(ch->r3d, &t);
+    g_renderer->draw_texture(&ch->ds, &t);
 }
 int r3d_blit(const Surf2D* s, const Surf2D* d, int dx, int dy, int dw, int dh, double sx, double sy, double sdx,
              double sdy) {
@@ -217,8 +276,9 @@ void r3d_cb_bind(GpuChannel* ch, int stage, u32 v) {
         LOG_LIMIT(4, "gpu: constant buffer bind %08x of stage %d is past the slots\n", v, stage);
         return;
     }
-    ch->cbind[stage][slot] = (v & 1) ? cb_address(ch->r3d) : 0;
-    ch->cbind_size[stage][slot] = (v & 1) ? ch->r3d[0x8E0] : 0;
+    ch->ds.bind.cb_addr[stage][slot] = (v & 1) ? cb_address(ch->r3d) : 0;
+    ch->ds.bind.cb_size[stage][slot] = (v & 1) ? ch->r3d[0x8E0] : 0;
+    ch->r3d_dirty |= R3D_CBIND;
 }
 /* LOAD_CONSTANT_BUFFER (0x8E4-0x8F3): a word at the buffer's address plus its offset (0x8E3), which moves on by 4.
    A batch's words are held and written in one go at its last, or before anything else */
@@ -234,6 +294,11 @@ void r3d_const_upload(GpuChannel* ch, u32 v, int last) {
 }
 void r3d_const_flush(GpuChannel* ch) {
     if (!ch->cb_n) return;
+    if (gpu_channel_verify(ch)) { /* the words, kept beside the decode, never in guest memory */
+        g_gpu_verify_cb(ch->cb_addr, ch->cb_words, ch->cb_n);
+        ch->cb_n = 0;
+        return;
+    }
     snx_le32_array(ch->cb_words, ch->cb_n); /* guest memory's order: the words aren't read again */
     gmem_write(ch->cb_addr, ch->cb_words, (u64)ch->cb_n * 4);
     ch->cb_n = 0;

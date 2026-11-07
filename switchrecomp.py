@@ -26,11 +26,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
-import nxloader, codegen, metroid_perf
+import nxloader, codegen, metroid_perf, logic_rate, mouse_aim
 
 RT = os.path.join(HERE, 'runtime')
 RUNTIME_SRC = ['plat', 'mem', 'kernel', 'ipc', 'svc_core', 'svc_hid', 'svc_fs', 'svc_vi', 'nvdrv', 'gpu', 'gpu_engines',
-               'gpu_3d', 'loader', 'main', 'audio', 'svc_launcher', 'cheats', 'nxextract']
+               'gpu_3d', 'loader', 'main', 'audio', 'svc_launcher', 'cheats', 'nxextract', 'input_kbm']
 ABI = 1
 # portable compilers next to us: tcc\, the GCC package (gcc\), w64devkit
 CC_DIRS = [os.path.join(HERE, *d) for d in (('tcc',), ('tools', 'tcc'), ('gcc', 'bin'), ('gcc', 'Library', 'bin'),
@@ -105,12 +105,18 @@ def gen_module(prog, mods, npdm, outdir, title, chunk_instrs, say):
     if cur: chunks.append(cur)
     files = []
     t0 = time.time()
+    prog.overrides = logic_rate.overrides(mods, prog.word)
+    if prog.overrides: say('  game logic rate: %d sites follow swr_logic_k (logic_rate.py)' % len(prog.overrides))
+    aim = mouse_aim.overrides(mods, prog.word) if prog.overrides else {}   # its yaw uses swr_logic_k
+    if aim: prog.overrides.update(aim); say('  mouse aim: %d sites add the mouse to the motion-control look (mouse_aim.py)' % len(aim))
     for ci, ch in enumerate(chunks):
         text = '\n'.join(codegen.emit_function(prog, f, funcs) for f in ch)
         text = metroid_perf.apply(text, mods, say)
         # only prototype what this chunk references
         refs = set(re.findall(r'\bF_[0-9A-F]+\b', text))
         protos = ''.join('void %s(CPU* RESTRICT c, u64 e);\n' % r for r in sorted(refs))
+        if 'swr_logic_val(' in text: protos += logic_rate.CHUNK_DECL
+        if 'swr_aim_take(' in text: protos += mouse_aim.CHUNK_DECL
         p = os.path.join(outdir, 'code_%03d.c' % ci)
         write_if_changed(p, '#include "cpu.h"\n' + ('#include <stdlib.h>\n' if 'getenv(' in text else '') + protos + text + '\n')
         files.append(p)
@@ -144,6 +150,8 @@ def gen_module(prog, mods, npdm, outdir, title, chunk_instrs, say):
     L.append('''typedef struct SwrModule { u32 abi; u32 nmods; const SwrModInfo* mods; u32 nentries; const u64* entry_addr; const GuestFn* entry_fn;
   GuestFn interp; u64 code_lo, code_hi; const char* title; u64 title_id; u32 main_stack, main_prio, main_core;
   void (*init)(const RtAPI* rt); u64 (*step)(CPU* c, u32 w, u64 pc); } SwrModule;''')
+    if prog.overrides: L.append(logic_rate.MODULE_C)
+    if aim: L.append(mouse_aim.MODULE_C)
     L.append('static const RtAPI* g_rt;')
     L.append('static void mod_init(const RtAPI* rt){ g_rt=rt; }')
     L.append('static SwrModule MOD;')
@@ -285,7 +293,7 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     if gles or gl: srcs += [os.path.join(RT, 'bcn', 'bcn.cpp'), os.path.join(RT, 'bcn', 'bcdec.cpp')]
     # LSFG (uses the user's Lossless.dll), desktop GL only
     spvc = None
-    # SWR_RELEASE=1 (the public Metroid Prime 4 Beyond release): no frame generation, and the renderer without DLSS
+    # SWR_RELEASE=1 (the public Metroid Prime 4 Beyond release): no frame generation
     release = bool(os.environ.get('SWR_RELEASE'))
     if gl and backend in ('win32', 'x11') and not release:
         spvc = os.path.join(RT, 'spvc', 'win' if target_win else 'lin', 'libspvc.a')
@@ -316,10 +324,10 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     if overlay: srcs += [os.path.join(RT, 'beyond_ui', f) for f in ('ui.cpp', 'ov.cpp') + (('fe.cpp', 'fe_sys_linux.cpp', 'fe_update_linux.cpp') if lx_frontend else ('stub_fe.c',))] + [os.path.join(RT, 'imgui', 'src', f) for f in ('imgui.cpp', 'imgui_draw.cpp', 'imgui_tables.cpp', 'imgui_widgets.cpp', 'imgui_impl_opengl3.cpp')]
     elif gl and not frontend: srcs += [os.path.join(RT, 'beyond_ui', 'stub.c')]
     # renderer=vulkan_native: ScarletNX's GPU front end + Vulkan renderer (GPL-3.0), prebuilt by work-profiler/build_snxvk.py
-    snxvk = os.path.join(RT, 'snxvk', 'libsnxvk_new_nodlss.a' if release else 'libsnxvk_new.a')   # ScarletNX main b5f4f14 (work-profiler/build_snxvk2.py)
+    snxvk = os.path.join(RT, 'snxvk', 'libsnxvk_new.a')   # ScarletNX main 3f15d931 with DLSS, release too (work-profiler/build_snxvk2.py)
     if os.environ.get('SWR_SNXVK_LIB'): snxvk = os.path.join(RT, 'snxvk', os.environ['SWR_SNXVK_LIB'])   # e.g. libsnxvk_new.a (re-vendor tests)
     snxvk = snxvk if os.path.isfile(snxvk) and target_win and backend == 'win32' and not os.environ.get('SWR_NO_SNXVK') else None
-    cmd = [cc, '-O' + opt, '-w', '-fno-strict-aliasing', '-Wl,-S', '-I', RT, '-I', os.path.join(RT, 'bcn'), '-I', os.path.join(RT, 'spvc'), '-I', os.path.join(RT, 'oh264', 'include'), '-I', os.path.join(RT, 'vp9', 'include'), '-I', os.path.join(RT, 'snxvk', 'deps', 'Vulkan-Headers-1.4.365', 'include')] + srcs + ['-o', out]
+    cmd = [cc, '-O' + opt, '-w', '-fno-strict-aliasing', '-Wl,-S', '-I', RT, '-I', os.path.join(RT, 'bcn'), '-I', os.path.join(RT, 'spvc'), '-I', os.path.join(RT, 'oh264', 'include'), '-I', os.path.join(RT, 'vp9', 'include'), '-I', os.path.join(RT, 'snxvk', 'deps', 'Vulkan-Headers-1.4.367', 'include')] + srcs + ['-o', out]
     # Linux without the static OpenH264 (linux/build_openh264.sh): the system's libopenh264.so, loaded at first use
     h264_dl = not h264 and not target_win and backend in ('x11', 'headless')
     if h264_dl: cmd += ['-DSWR_H264_DLOPEN']
@@ -343,6 +351,7 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     if target_win:
         cmd += ['-static', '-lgdi32', '-lwinmm', '-luser32', '-lopengl32', '-lcomdlg32', '-lshell32', '-mwindows' if backend == 'win32' else '-mconsole']
         if backend == 'win32': cmd += ['-lmfplat', '-lmfreadwrite', '-lmfuuid', '-lole32']
+        if snxvk: cmd += ['-lpthread']   # winpthread, statically: the renderer's pthread mutexes and rwlocks
         if frontend: cmd += ['-ld3d11', '-ldxgi', '-ld3dcompiler', '-ldwmapi', '-luuid', '-loleaut32', '-lurlmon', '-lwinhttp', '-lbcrypt']
     else:
         cmd += ['-lpthread', '-ldl', '-lm', '-rdynamic']

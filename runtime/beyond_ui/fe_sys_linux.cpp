@@ -16,6 +16,7 @@
 #include <dlfcn.h>
 #include <signal.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <sys/resource.h>
 
@@ -35,6 +36,7 @@ std::string join(const std::string& a, const std::string& b) {
 }
 bool file_exists(const std::string& p) { struct stat st; return stat(p.c_str(), &st) == 0 && S_ISREG(st.st_mode); }
 bool dir_exists(const std::string& p) { struct stat st; return stat(p.c_str(), &st) == 0 && S_ISDIR(st.st_mode); }
+double disk_free_gb(const std::string& dir) { struct statvfs v; return statvfs(dir.c_str(), &v) == 0 ? (double)v.f_bavail * v.f_frsize / 1073741824.0 : -1; }
 long long file_size(const std::string& p) { struct stat st; return stat(p.c_str(), &st) == 0 ? (long long)st.st_size : -1; }
 bool make_dirs(const std::string& p) {
     if (p.empty() || dir_exists(p)) return true;

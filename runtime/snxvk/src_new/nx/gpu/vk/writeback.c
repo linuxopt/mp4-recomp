@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "nx/gpu/gpu.h"
+#include "nx/memory/mem.h"
 #include "nx/runtime/platform/log.h"
 #include "nx/gpu/vk/vk.h"
 
@@ -14,37 +15,157 @@ void vk_result_begin(void) { t_result_depth++; }
 void vk_result_end(void) { t_result_depth--; }
 int vk_result_landing(void) { return t_result_depth != 0; }
 
-void vk_write_changed(u64 addr, const u8* res, const u8* org, u32 size) {
+/* whether [p, p + n) overlaps the guest's address space, where pages the GPU holds fault when read. From AS_BASE:
+   under NCE g_mem is 0, and on Android what lies below the moved layout is the app's own (mem.c) */
+static int in_guest(const u8* p, u32 n) {
+    uintptr_t a = (uintptr_t)p;
+    return a < (uintptr_t)GP(AS_SIZE) && a + n > (uintptr_t)GP(AS_BASE);
+}
+
+/* the bytes of [k, k + w) where res and org differ (w at most 8): eight at a time when there are eight */
+static int granule_differs(const u8* res, const u8* org, u32 k, u32 w) {
+    u64 a, b;
+    if (w < 8) return memcmp(res + k, org + k, w) != 0;
+    memcpy(&a, res + k, 8);
+    memcpy(&b, org + k, 8);
+    return a != b;
+}
+
+/* 0xFF in each byte of x that isn't zero, 0 in the others: each byte's low bit becomes the OR of its bits */
+static u64 nonzero_bytes(u64 x) {
+    x |= x >> 4;
+    x |= x >> 2;
+    x |= x >> 1;
+    return (x & 0x0101010101010101ull) * 0xFF;
+}
+
+/* the first change of a landing: guest memory readied for the write, its bytes now (cur) where they can be read */
+static const u8* landing_begin(u64 addr, u32 size, u8** dst, u8** tmp) {
     vk_result_begin();
     vk_rt_before_write(addr, size);
-    u8* dst = gmem_ptr(addr, size);
-    u8* tmp = NULL;
-    const u8* cur = dst;
-    int changed = 0;
-    if (!cur) {
-        tmp = malloc(size);
-        if (!tmp) fatal("Out of memory landing a shader storage buffer");
-        gmem_read(addr, tmp, size);
-        cur = tmp;
-    }
+    *dst = gmem_ptr(addr, size);
+    if (*dst) return *dst;
+    *tmp = malloc(size);
+    if (!*tmp) fatal("Out of memory landing a shader storage buffer");
+    gmem_read(addr, *tmp, size);
+    return *tmp;
+}
+
+void vk_write_changed_runs(u64 addr, const u8* res, const u8* org, u32 size, VkChangedRun run, void* user) {
+    /* res and org are host copies: the shader's output read back into host-cached memory, and the bytes it started
+       from, snapshotted when it was bound (buffer.c, compute.c, surface.c). Comparing them reads no guest page, so it
+       can't fault on one the GPU holds. Only cur below reads guest memory, after vk_rt_before_write, which the first
+       change takes: a result that changed nothing reads no guest memory, allocates and flushes nothing */
+    u8 *dst = NULL, *tmp = NULL;
+    const u8* cur = NULL;
+    u32 run_from = 0, run_to = 0, ws = 0, we = 0; /* the run of changed granules, and the bytes to write */
+    int begun = 0, changed = 0;
+    if (!size) return;
+    if (in_guest(res, size) || in_guest(org, size)) fatal("vulkan: a storage result compared in guest memory");
     for (u32 i = 0; i < size;) {
-        if (i + 8 <= size && !memcmp(res + i, org + i, 8)) {
-            i += 8;
+        u32 end = size - i < 1024 ? size - i : 1024;
+        end += i;
+        /* Large storage bindings often change only a few bytes: the host's vectorized comparison of the two host
+           copies skips their unchanged ranges, and guest memory is read only where the shader changed a byte */
+        if (!memcmp(res + i, org + i, end - i)) {
+            i = end;
             continue;
         }
-        if (res[i] == org[i] || cur[i] != org[i]) {
-            i++;
-            continue;
+        /* SwitchRecomp (vk_fast_writeback): where guest memory still holds what the shader started from over the
+           whole chunk, the merge below takes every byte the shader changed and the rest are the same in all three,
+           so the chunk lands as the shader's output in one copy. A graphics storage image whose texels change only
+           some of their bytes went byte by byte here, every frame: most of the landing's time, on the path to the
+           syncpoint the game waits for. Only within one guest page (the merge's page rule) and with no run callback
+           (buffer.c's wants the changed granules) */
+        if (g_swr_fast_writeback && !run && ((addr + i) >> 12) == ((addr + end - 1) >> 12)) {
+            if (!begun) {
+                begun = 1;
+                cur = landing_begin(addr, size, &dst, &tmp);
+            }
+            if (!memcmp(cur + i, org + i, end - i)) {
+                if (we != i) { /* not where the pending run ends: it is written, and the chunk starts a new one */
+                    if (we != ws) {
+                        if (dst)
+                            memcpy(dst + ws, res + ws, we - ws);
+                        else
+                            gmem_write(addr + ws, res + ws, we - ws);
+                    }
+                    ws = i;
+                }
+                we = end;
+                changed = 1;
+                i = end;
+                continue;
+            }
         }
-        u32 s = i;
-        while (i < size && res[i] != org[i] && cur[i] == org[i]) i++;
+        for (u32 k = i; k < end; k += 8) { /* i is a multiple of 1024, so granules start at multiples of 8 */
+            u32 w = end - k < 8 ? end - k : 8;
+            if (!granule_differs(res, org, k, w)) continue;
+            if (run && run_to == k && run_to)
+                run_to = k + w;
+            else {
+                if (run && run_to) run(user, run_from, run_to);
+                run_from = k;
+                run_to = k + w;
+            }
+            if (!begun) {
+                begun = 1;
+                cur = landing_begin(addr, size, &dst, &tmp);
+            }
+            /* the bytes the shader changed where guest memory still holds what it started from, in runs that
+               go on across granules. A whole granule on one guest page is taken at once when all of its bytes or
+               none of them are (the shader's own outputs mostly change every byte: byte by byte, the merge was a
+               tenth of one game's GPU thread); a mixed one, or one across a page the GPU may hold, byte by byte */
+            if (w == 8 && ((addr + k) & 0xFFF) <= 0xFF8) {
+                u64 a, b, c;
+                memcpy(&a, res + k, 8);
+                memcpy(&b, org + k, 8);
+                memcpy(&c, cur + k, 8);
+                u64 take = nonzero_bytes(a ^ b) & ~nonzero_bytes(c ^ b);
+                if (!take) continue;
+                if (take == ~0ull) {
+                    if (we != k) { /* not where the pending run ends: it is written, and a new one starts */
+                        if (we != ws) {
+                            if (dst)
+                                memcpy(dst + ws, res + ws, we - ws);
+                            else
+                                gmem_write(addr + ws, res + ws, we - ws);
+                        }
+                        ws = k;
+                    }
+                    we = k + 8;
+                    changed = 1;
+                    continue;
+                }
+            }
+            for (u32 b = k; b < k + w; b++) {
+                if (res[b] == org[b] || cur[b] != org[b]) continue;
+                if (we != b) { /* not where the pending run ends: it is written, and a new one starts */
+                    if (we != ws) {
+                        if (dst)
+                            memcpy(dst + ws, res + ws, we - ws);
+                        else
+                            gmem_write(addr + ws, res + ws, we - ws);
+                    }
+                    ws = b;
+                }
+                we = b + 1;
+                changed = 1;
+            }
+        }
+        i = end;
+    }
+    if (run && run_to) run(user, run_from, run_to);
+    if (we != ws) {
         if (dst)
-            memcpy(dst + s, res + s, i - s);
+            memcpy(dst + ws, res + ws, we - ws);
         else
-            gmem_write(addr + s, res + s, i - s);
-        changed = 1;
+            gmem_write(addr + ws, res + ws, we - ws);
     }
     free(tmp);
     if (changed) gpu_mem_written_shader(addr, size); /* other GPU virtual addresses can alias these guest pages */
-    vk_result_end();
+    if (begun) vk_result_end();
+}
+void vk_write_changed(u64 addr, const u8* res, const u8* org, u32 size) {
+    vk_write_changed_runs(addr, res, org, size, NULL, NULL);
 }

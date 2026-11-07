@@ -9,8 +9,25 @@
 namespace ui {
 
 // ---------------------------------------------------------------- colours
-extern const ImU32 C_BG0, C_BG1, C_PANEL, C_PANEL_HI, C_LINE, C_CYAN, C_CYAN_DIM, C_RED, C_RED_HI, C_TEXT,
-    C_DIM, C_OK, C_WARN, C_BAD;
+// The theme sets these (theme_apply); C_RED is the accent and C_CYAN the line colour whatever their hue.
+// C_OK, C_WARN and C_BAD are status colours and stay the same in every theme.
+extern ImU32 C_BG0, C_BG1, C_PANEL, C_PANEL_HI, C_LINE, C_CYAN, C_CYAN_DIM, C_RED, C_RED_HI, C_TEXT, C_DIM;
+extern const ImU32 C_OK, C_WARN, C_BAD;
+ImU32 alpha(ImU32 c, int a);   // c with its alpha replaced
+ImU32 surface(float k);        // an opaque panel tone: the background mixed with the line colour, k = 0 to 1
+
+// ---------------------------------------------------------------- themes (the launcher's look, as data)
+struct Theme {
+    const char* key; const char* label;
+    ImU32 bg0, bg1, panel, panel_hi, line, cyan, red, red_hi, text, dim;
+};
+const std::vector<Theme>& themes();   // the built-in ones; "beyond" first (the default)
+// key: a built-in theme, or "custom" to read custom_path (key=#RRGGBB lines, missing keys from "beyond").
+// Returns false (and keeps "beyond") when the key is unknown or the custom file can't be read; *note says why.
+bool theme_apply(const std::string& key, const std::string& custom_path, std::string* note);
+std::string theme_template();          // a commented starter theme.ini (the "beyond" colours)
+float contrast(ImU32 a, ImU32 b);      // WCAG contrast ratio, 1 to 21
+extern bool g_reduce_motion;           // no turning rings, no moving progress stripes
 
 // ---------------------------------------------------------------- fonts / style
 struct Fonts { ImFont* body = nullptr; ImFont* head = nullptr; };

@@ -16,14 +16,101 @@
 
 namespace ui {
 
-const ImU32 C_BG0 = IM_COL32(4, 7, 13, 255), C_BG1 = IM_COL32(10, 17, 30, 255), C_PANEL = IM_COL32(9, 15, 27, 215),
-            C_PANEL_HI = IM_COL32(18, 32, 52, 235), C_LINE = IM_COL32(52, 96, 128, 140), C_CYAN = IM_COL32(64, 214, 255, 255),
-            C_CYAN_DIM = IM_COL32(64, 214, 255, 70), C_RED = IM_COL32(226, 30, 44, 255), C_RED_HI = IM_COL32(240, 52, 60, 255),
-            C_TEXT = IM_COL32(232, 238, 246, 255), C_DIM = IM_COL32(140, 156, 180, 255), C_OK = IM_COL32(80, 220, 150, 255),
-            C_WARN = IM_COL32(250, 196, 80, 255), C_BAD = IM_COL32(255, 84, 84, 255);
-Fonts g_fonts; float g_scale = 1.0f; RowCtx g_row; bool g_focus_first;
+ImU32 C_BG0 = IM_COL32(4, 7, 13, 255), C_BG1 = IM_COL32(10, 17, 30, 255), C_PANEL = IM_COL32(9, 15, 27, 215),
+      C_PANEL_HI = IM_COL32(18, 32, 52, 235), C_LINE = IM_COL32(52, 96, 128, 140), C_CYAN = IM_COL32(64, 214, 255, 255),
+      C_CYAN_DIM = IM_COL32(64, 214, 255, 70), C_RED = IM_COL32(226, 30, 44, 255), C_RED_HI = IM_COL32(240, 52, 60, 255),
+      C_TEXT = IM_COL32(232, 238, 246, 255), C_DIM = IM_COL32(140, 156, 180, 255);
+const ImU32 C_OK = IM_COL32(80, 220, 150, 255), C_WARN = IM_COL32(250, 196, 80, 255), C_BAD = IM_COL32(255, 84, 84, 255);
+Fonts g_fonts; float g_scale = 1.0f; RowCtx g_row; bool g_focus_first; bool g_reduce_motion;
 
 float S(float px) { return px * g_scale; }
+ImU32 alpha(ImU32 c, int a) { return (c & ~IM_COL32_A_MASK) | ((ImU32)(a < 0 ? 0 : a > 255 ? 255 : a) << IM_COL32_A_SHIFT); }
+ImU32 surface(float k) {
+    auto ch = [&](int sh) { float x = (C_BG1 >> sh & 255) * (1 - k) + (C_LINE >> sh & 255) * k; return (int)(x + 0.5f); };
+    return IM_COL32(ch(IM_COL32_R_SHIFT), ch(IM_COL32_G_SHIFT), ch(IM_COL32_B_SHIFT), 255);
+}
+
+// ---------------------------------------------------------------- themes
+// WCAG contrast of the built-in themes: white on the accent 4.7 to 6.2:1 (AA is 4.5); white on the bright accent 4.0 to 5.1:1,
+// which only fills focused big buttons (large text, AA is 3); text on the background 16 to 20:1.
+const std::vector<Theme>& themes() {
+    static const std::vector<Theme> t = {
+        {"beyond", "Beyond (red and cyan)", IM_COL32(4, 7, 13, 255), IM_COL32(10, 17, 30, 255), IM_COL32(9, 15, 27, 215), IM_COL32(18, 32, 52, 235),
+         IM_COL32(52, 96, 128, 140), IM_COL32(64, 214, 255, 255), IM_COL32(226, 30, 44, 255), IM_COL32(240, 52, 60, 255),
+         IM_COL32(232, 238, 246, 255), IM_COL32(140, 156, 180, 255)},
+        {"amber", "Amber visor", IM_COL32(9, 6, 3, 255), IM_COL32(24, 16, 8, 255), IM_COL32(20, 14, 8, 215), IM_COL32(44, 30, 16, 235),
+         IM_COL32(128, 96, 52, 140), IM_COL32(255, 186, 64, 255), IM_COL32(184, 68, 0, 255), IM_COL32(204, 82, 8, 255),
+         IM_COL32(246, 238, 228, 255), IM_COL32(184, 168, 146, 255)},
+        {"contrast", "High contrast", IM_COL32(0, 0, 0, 255), IM_COL32(6, 8, 12, 255), IM_COL32(0, 0, 0, 235), IM_COL32(20, 28, 40, 245),
+         IM_COL32(150, 190, 220, 220), IM_COL32(90, 230, 255, 255), IM_COL32(196, 0, 28, 255), IM_COL32(220, 16, 40, 255),
+         IM_COL32(255, 255, 255, 255), IM_COL32(205, 214, 228, 255)},
+    };
+    return t;
+}
+
+static void theme_set(const Theme& t) {
+    C_BG0 = t.bg0; C_BG1 = t.bg1; C_PANEL = t.panel; C_PANEL_HI = t.panel_hi; C_LINE = t.line; C_CYAN = t.cyan;
+    C_CYAN_DIM = alpha(t.cyan, 70); C_RED = t.red; C_RED_HI = t.red_hi; C_TEXT = t.text; C_DIM = t.dim;
+    apply_style(g_scale);   // ImGui's own colours (buttons, scrollbars) follow the theme
+}
+
+static const char* const THEME_KEYS[] = {"bg_bottom", "bg_top", "panel", "panel_focus", "line", "line_bright", "accent", "accent_bright", "text", "text_dim"};
+
+static bool parse_hex(const char* s, ImU32* out, int keep_alpha) {
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '#') s++;
+    unsigned v; int n = 0;
+    if (sscanf(s, "%x%n", &v, &n) != 1) return false;
+    if (n == 6) { *out = IM_COL32(v >> 16 & 255, v >> 8 & 255, v & 255, keep_alpha); return true; }
+    if (n == 8) { *out = IM_COL32(v >> 24 & 255, v >> 16 & 255, v >> 8 & 255, v & 255); return true; }
+    return false;
+}
+
+bool theme_apply(const std::string& key, const std::string& custom_path, std::string* note) {
+    if (note) note->clear();
+    const std::vector<Theme>& all = themes();
+    for (auto& t : all) if (key == t.key) { theme_set(t); return true; }
+    if (key != "custom") { theme_set(all[0]); if (note) *note = "Unknown theme \"" + key + "\": using Beyond."; return false; }
+    FILE* f = fopen(custom_path.c_str(), "rb");
+    if (!f) { theme_set(all[0]); if (note) *note = "No theme.ini yet: using Beyond. Choose \"Edit the custom theme\" to make one."; return false; }
+    Theme t = all[0];
+    ImU32* slot[] = {&t.bg0, &t.bg1, &t.panel, &t.panel_hi, &t.line, &t.cyan, &t.red, &t.red_hi, &t.text, &t.dim};
+    char line[256]; int lineno = 0; std::string bad;
+    while (fgets(line, sizeof line, f)) {
+        lineno++;
+        char* p = line; while (*p == ' ' || *p == '\t') p++;
+        if (*p == ';' || *p == '#' || *p == '[' || *p == '\r' || *p == '\n' || !*p) continue;
+        char* eq = strchr(p, '='); if (!eq) continue;
+        std::string k(p, eq - p); while (!k.empty() && (k.back() == ' ' || k.back() == '\t')) k.pop_back();
+        int i = 0; for (; i < (int)(sizeof THEME_KEYS / sizeof *THEME_KEYS); i++) if (!_stricmp(k.c_str(), THEME_KEYS[i])) break;
+        if (i == (int)(sizeof THEME_KEYS / sizeof *THEME_KEYS)) { if (bad.empty()) bad = fmt("line %d: unknown key \"%s\"", lineno, k.c_str()); continue; }
+        if (!parse_hex(eq + 1, slot[i], (int)(*slot[i] >> IM_COL32_A_SHIFT & 255)) && bad.empty()) bad = fmt("line %d: \"%s\" is not #RRGGBB", lineno, k.c_str());
+    }
+    fclose(f);
+    theme_set(t);
+    if (note && !bad.empty()) *note = "theme.ini " + bad + " (ignored).";
+    return true;
+}
+
+std::string theme_template() {
+    const Theme& t = themes()[0];
+    const ImU32 v[] = {t.bg0, t.bg1, t.panel, t.panel_hi, t.line, t.cyan, t.red, t.red_hi, t.text, t.dim};
+    std::string s = "; Custom launcher theme. Pick \"Custom (theme.ini)\" as the launcher theme to use it.\n"
+                    "; Colours are #RRGGBB, or #RRGGBBAA with transparency. A missing key keeps the Beyond colour.\n"
+                    "; White text sits on the accent colour: keep it dark enough to read (the launcher shows the contrast).\n";
+    for (int i = 0; i < 10; i++) {
+        ImU32 c = v[i]; int a = c >> IM_COL32_A_SHIFT & 255;
+        s += fmt(a == 255 ? "%s=#%02X%02X%02X\n" : "%s=#%02X%02X%02X%02X\n", THEME_KEYS[i], c >> IM_COL32_R_SHIFT & 255, c >> IM_COL32_G_SHIFT & 255,
+                 c >> IM_COL32_B_SHIFT & 255, a);
+    }
+    return s;
+}
+
+static float lum(ImU32 c) {
+    auto ch = [](int v) { float x = v / 255.0f; return x <= 0.03928f ? x / 12.92f : powf((x + 0.055f) / 1.055f, 2.4f); };
+    return 0.2126f * ch(c >> IM_COL32_R_SHIFT & 255) + 0.7152f * ch(c >> IM_COL32_G_SHIFT & 255) + 0.0722f * ch(c >> IM_COL32_B_SHIFT & 255);
+}
+float contrast(ImU32 a, ImU32 b) { float x = lum(a), y = lum(b); if (x < y) std::swap(x, y); return (x + 0.05f) / (y + 0.05f); }
 
 std::string fmt(const char* f, ...) {
     char b[2048]; va_list a; va_start(a, f); vsnprintf(b, sizeof b, f, a); va_end(a); return b;
@@ -71,12 +158,13 @@ void apply_style(float scale) {
     ImVec4* c = st.Colors;
     c[ImGuiCol_WindowBg] = ImVec4(0, 0, 0, 0); c[ImGuiCol_ChildBg] = ImVec4(0, 0, 0, 0);
     c[ImGuiCol_Text] = ImGui::ColorConvertU32ToFloat4(C_TEXT); c[ImGuiCol_TextDisabled] = ImGui::ColorConvertU32ToFloat4(C_DIM);
-    c[ImGuiCol_FrameBg] = ImVec4(0.06f, 0.11f, 0.19f, 0.9f); c[ImGuiCol_FrameBgHovered] = ImVec4(0.09f, 0.17f, 0.28f, 1);
-    c[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0); c[ImGuiCol_ScrollbarGrab] = ImVec4(0.25f, 0.84f, 1, 0.25f);
-    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(0.25f, 0.84f, 1, 0.5f); c[ImGuiCol_ScrollbarGrabActive] = ImVec4(0.25f, 0.84f, 1, 0.7f);
+    auto F4 = [](ImU32 u) { return ImGui::ColorConvertU32ToFloat4(u); };
+    c[ImGuiCol_FrameBg] = F4(alpha(surface(0.2f), 230)); c[ImGuiCol_FrameBgHovered] = F4(surface(0.35f));
+    c[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0); c[ImGuiCol_ScrollbarGrab] = F4(alpha(C_CYAN, 64));
+    c[ImGuiCol_ScrollbarGrabHovered] = F4(alpha(C_CYAN, 128)); c[ImGuiCol_ScrollbarGrabActive] = F4(alpha(C_CYAN, 179));
     c[ImGuiCol_NavCursor] = ImVec4(0, 0, 0, 0);   // our rows draw their own focus
-    c[ImGuiCol_Button] = ImVec4(0.07f, 0.13f, 0.22f, 1); c[ImGuiCol_ButtonHovered] = ImVec4(0.12f, 0.22f, 0.36f, 1);
-    c[ImGuiCol_ButtonActive] = ImVec4(0.886f, 0.118f, 0.173f, 1); c[ImGuiCol_PopupBg] = ImVec4(0.03f, 0.06f, 0.1f, 0.97f);
+    c[ImGuiCol_Button] = F4(surface(0.2f)); c[ImGuiCol_ButtonHovered] = F4(surface(0.45f));
+    c[ImGuiCol_ButtonActive] = F4(C_RED); c[ImGuiCol_PopupBg] = F4(alpha(C_BG0, 247));
     c[ImGuiCol_Border] = ImGui::ColorConvertU32ToFloat4(C_LINE); c[ImGuiCol_InputTextCursor] = ImGui::ColorConvertU32ToFloat4(C_CYAN);
     st.ScaleAllSizes(scale);
     st.FontScaleDpi = scale;
@@ -213,7 +301,8 @@ void chamfer_rect(ImDrawList* dl, ImVec2 a, ImVec2 b, float cut, ImU32 fill, ImU
 
 void background(ImDrawList* dl, ImVec2 a, ImVec2 b, float t, bool translucent) {
     float w = b.x - a.x, h = b.y - a.y;
-    if (translucent) dl->AddRectFilled(a, b, IM_COL32(2, 5, 10, 205));
+    if (g_reduce_motion) t = 0;   // the rings stand still
+    if (translucent) dl->AddRectFilled(a, b, alpha(C_BG0, 205));
     else dl->AddRectFilledMultiColor(a, b, C_BG1, C_BG0, C_BG0, C_BG1);
     // a faint hexagonal lattice
     float hs = S(46), hx = hs * 1.732f;
@@ -222,19 +311,19 @@ void background(ImDrawList* dl, ImVec2 a, ImVec2 b, float t, bool translucent) {
             ImVec2 c(a.x + col * hx + (row & 1) * hx / 2, a.y + row * hs * 1.5f);
             ImVec2 pts[6];
             for (int k = 0; k < 6; k++) { float an = 3.14159f / 3 * k + 3.14159f / 6; pts[k] = {c.x + cosf(an) * hs, c.y + sinf(an) * hs}; }
-            float dx = (c.x - a.x) / w; int alpha = (int)(10 + 14 * dx);
-            dl->AddPolyline(pts, 6, IM_COL32(64, 214, 255, alpha), ImDrawFlags_Closed, 1.0f);
+            float dx = (c.x - a.x) / w; int al = (int)(10 + 14 * dx);
+            dl->AddPolyline(pts, 6, alpha(C_CYAN, al), ImDrawFlags_Closed, 1.0f);
         }
     // scanner rings on the right, slowly turning
     ImVec2 rc(a.x + w * 0.80f, a.y + h * 0.42f); float R = h * 0.42f;
     for (int i = 0; i < 3; i++) {
         float r = R * (0.55f + 0.22f * i), s = t * (0.10f + 0.05f * i) * (i & 1 ? -1 : 1);
-        dl->PathArcTo(rc, r, s, s + 4.2f, 64); dl->PathStroke(IM_COL32(64, 214, 255, 26 + 8 * i), 0, S(1.5f));
-        dl->PathArcTo(rc, r, s + 4.6f, s + 5.6f, 24); dl->PathStroke(IM_COL32(226, 30, 44, 46), 0, S(2.0f));
+        dl->PathArcTo(rc, r, s, s + 4.2f, 64); dl->PathStroke(alpha(C_CYAN, 26 + 8 * i), 0, S(1.5f));
+        dl->PathArcTo(rc, r, s + 4.6f, s + 5.6f, 24); dl->PathStroke(alpha(C_RED, 46), 0, S(2.0f));
     }
     // a light streak and a vignette
-    dl->AddRectFilledMultiColor({a.x, a.y + h * 0.70f}, {b.x, a.y + h * 0.70f + S(2)}, IM_COL32(226, 30, 44, 0), IM_COL32(226, 30, 44, 60),
-                                IM_COL32(226, 30, 44, 60), IM_COL32(226, 30, 44, 0));
+    dl->AddRectFilledMultiColor({a.x, a.y + h * 0.70f}, {b.x, a.y + h * 0.70f + S(2)}, alpha(C_RED, 0), alpha(C_RED, 60),
+                                alpha(C_RED, 60), alpha(C_RED, 0));
     dl->AddRectFilledMultiColor(a, {b.x, a.y + h * 0.18f}, IM_COL32(0, 0, 0, 150), IM_COL32(0, 0, 0, 150), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0));
     dl->AddRectFilledMultiColor({a.x, b.y - h * 0.2f}, b, IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 0), IM_COL32(0, 0, 0, 170), IM_COL32(0, 0, 0, 170));
 }
@@ -332,10 +421,10 @@ static bool row_begin(const char* id, const char* label, const char* tag, ImRect
     r = ImRect(p, {p.x + w, p.y + h});
     ImDrawList* dl = ImGui::GetWindowDrawList();
     if (focused || hovered) {
-        dl->AddRectFilledMultiColor(r.Min, r.Max, IM_COL32(64, 214, 255, focused ? 46 : 22), IM_COL32(64, 214, 255, 6),
-                                    IM_COL32(64, 214, 255, 6), IM_COL32(64, 214, 255, focused ? 46 : 22));
+        dl->AddRectFilledMultiColor(r.Min, r.Max, alpha(C_CYAN, focused ? 46 : 22), alpha(C_CYAN, 6),
+                                    alpha(C_CYAN, 6), alpha(C_CYAN, focused ? 46 : 22));
         if (focused) { dl->AddRectFilled(r.Min, {r.Min.x + S(4), r.Max.y}, C_RED); dl->AddRect(r.Min, r.Max, C_CYAN_DIM, 0, 0, 1); }
-    } else dl->AddLine({r.Min.x, r.Max.y - 1}, {r.Max.x, r.Max.y - 1}, IM_COL32(52, 96, 128, 50), 1);
+    } else dl->AddLine({r.Min.x, r.Max.y - 1}, {r.Max.x, r.Max.y - 1}, alpha(C_LINE, 50), 1);
     float ty = r.Min.y + (h - ImGui::GetFontSize()) / 2;
     dl->AddText({r.Min.x + S(18), ty}, focused ? IM_COL32(255, 255, 255, 255) : C_TEXT, label);
     if (tag && *tag) {
@@ -364,7 +453,7 @@ bool row_bool(const char* id, const char* label, bool* v, const char* tag) {
     if (c || (f && (g_row.pad_left || g_row.pad_right || g_row.confirm))) { *v = !*v; ch = true; }
     ImDrawList* dl = ImGui::GetWindowDrawList();
     float h = r.GetHeight(), sw = S(52), sh = S(24); ImVec2 a(r.Max.x - S(16) - sw, r.Min.y + (h - sh) / 2);
-    dl->AddRectFilled(a, {a.x + sw, a.y + sh}, *v ? IM_COL32(226, 30, 44, 200) : IM_COL32(30, 44, 66, 255), sh / 2);
+    dl->AddRectFilled(a, {a.x + sw, a.y + sh}, *v ? alpha(C_RED, 200) : surface(0.4f), sh / 2);
     dl->AddRect(a, {a.x + sw, a.y + sh}, *v ? C_RED_HI : C_LINE, sh / 2, 0, 1);
     float kx = *v ? a.x + sw - sh / 2 : a.x + sh / 2;
     dl->AddCircleFilled({kx, a.y + sh / 2}, sh / 2 - S(3), *v ? IM_COL32(255, 255, 255, 255) : C_DIM);
@@ -401,9 +490,9 @@ bool row_slider(const char* id, const char* label, float* v, float lo, float hi,
     if (*v < lo) *v = lo; if (*v > hi) *v = hi;
     if (*v != old) ch = true;
     float t = (*v - lo) / (hi - lo);
-    chamfer_rect(dl, a, b, S(6), IM_COL32(12, 22, 38, 255), f ? C_CYAN : C_LINE, 1);
+    chamfer_rect(dl, a, b, S(6), surface(0.05f), f ? C_CYAN : C_LINE, 1);
     ImVec2 fb(a.x + (b.x - a.x) * t, b.y);
-    dl->PushClipRect(a, fb, true); chamfer_rect(dl, a, b, S(6), f ? IM_COL32(226, 30, 44, 190) : IM_COL32(226, 30, 44, 120), 0); dl->PopClipRect();
+    dl->PushClipRect(a, fb, true); chamfer_rect(dl, a, b, S(6), f ? alpha(C_RED, 190) : alpha(C_RED, 120), 0); dl->PopClipRect();
     dl->AddRectFilled({fb.x - S(1.5f), a.y - S(3)}, {fb.x + S(1.5f), b.y + S(3)}, IM_COL32(255, 255, 255, 230));
     ImVec2 ts = ImGui::CalcTextSize(text);
     dl->AddText({(a.x + b.x) / 2 - ts.x / 2 + 1, (a.y + b.y) / 2 - ts.y / 2 + 1}, IM_COL32(0, 0, 0, 200), text);
@@ -416,7 +505,7 @@ bool row_button(const char* id, const char* label, const char* value, bool prima
     ImDrawList* dl = ImGui::GetWindowDrawList();
     const char* t = value ? value : "SELECT"; ImVec2 ts = ImGui::CalcTextSize(t);
     ImVec2 a(r.Max.x - S(16) - ts.x - S(28), r.Min.y + S(9)), b(r.Max.x - S(16), r.Max.y - S(9));
-    chamfer_rect(dl, a, b, S(5), primary ? IM_COL32(226, 30, 44, f ? 255 : 200) : IM_COL32(20, 36, 58, 255), f ? C_CYAN : C_LINE, 1);
+    chamfer_rect(dl, a, b, S(5), primary ? alpha(C_RED, f ? 255 : 200) : surface(0.22f), f ? C_CYAN : C_LINE, 1);
     dl->AddText({a.x + S(14), (a.y + b.y) / 2 - ts.y / 2}, IM_COL32(255, 255, 255, 255), t);
     return c || (f && g_row.confirm);
 }
@@ -434,7 +523,7 @@ bool big_button(const char* id, const char* label, ImVec2 size, bool primary) {
     ImVec2 p = ImGui::GetCursorScreenPos();
     bool c = ImGui::InvisibleButton(id, size); take_focus_if_first(); nav_item(); bool f = ImGui::IsItemFocused(), h = ImGui::IsItemHovered();
     ImDrawList* dl = ImGui::GetWindowDrawList(); ImVec2 b(p.x + size.x, p.y + size.y);
-    ImU32 fill = primary ? (f || h ? C_RED_HI : C_RED) : (f || h ? IM_COL32(28, 52, 84, 255) : IM_COL32(16, 30, 50, 255));
+    ImU32 fill = primary ? (f || h ? C_RED_HI : C_RED) : (f || h ? surface(0.4f) : surface(0.15f));
     chamfer_rect(dl, p, b, size.y * 0.28f, fill, f ? IM_COL32(255, 255, 255, 255) : (primary ? 0 : C_LINE), f ? S(2) : 1);
     if (f) chamfer_rect(dl, {p.x - S(4), p.y - S(4)}, {b.x + S(4), b.y + S(4)}, size.y * 0.3f, 0, C_CYAN_DIM, S(1.5f));
     float fs = std::min(size.y * 0.42f, S(30)); ImVec2 ts = ImGui::GetFont()->CalcTextSizeA(fs, FLT_MAX, 0, label);
@@ -446,11 +535,11 @@ void progress_bar(float frac, ImVec2 size, const char* text) {
     ImVec2 p = ImGui::GetCursorScreenPos(); ImGui::Dummy(size);
     ImDrawList* dl = ImGui::GetWindowDrawList(); ImVec2 b(p.x + size.x, p.y + size.y);
     if (frac < 0) frac = 0; if (frac > 1) frac = 1;
-    chamfer_rect(dl, p, b, S(8), IM_COL32(8, 16, 28, 255), C_LINE, 1);
+    chamfer_rect(dl, p, b, S(8), surface(0.0f), C_LINE, 1);
     ImVec2 fb(p.x + size.x * frac, b.y);
     dl->PushClipRect(p, fb, true);
-    dl->AddRectFilledMultiColor(p, b, IM_COL32(226, 30, 44, 255), IM_COL32(240, 52, 60, 255), IM_COL32(240, 52, 60, 255), IM_COL32(226, 30, 44, 255));
-    float t = (float)ImGui::GetTime();
+    dl->AddRectFilledMultiColor(p, b, alpha(C_RED, 255), C_RED_HI, C_RED_HI, alpha(C_RED, 255));
+    float t = g_reduce_motion ? 0.0f : (float)ImGui::GetTime();
     for (float x = p.x - size.y + fmodf(t * 60, size.y * 2); x < fb.x; x += size.y * 2)   // moving stripes
         dl->AddQuadFilled({x, b.y}, {x + size.y, p.y}, {x + size.y * 1.6f, p.y}, {x + size.y * 0.6f, b.y}, IM_COL32(255, 255, 255, 28));
     dl->PopClipRect();
@@ -507,9 +596,8 @@ static std::vector<Opt> build_options() {
     B("game_dynamic_resolution", "Graphics", "Graphics", "Game's own dynamic resolution", LIVE_YES, "0", "Let the game lower its own resolution like on the console.");
     B("hdr", "Graphics", "Graphics", "HDR output (experimental)", LIVE_RESTART, "0", "Native Vulkan only, with \"Use HDR\" on in Windows display settings.");
     I("hdr_paper_white", "Graphics", "Graphics", "HDR paper white (nits)", LIVE_RESTART, "200", 80, 500, 10, "");
-#ifndef SWR_RELEASE
-    B("dlss", "Graphics", "Graphics", "NVIDIA DLAA", LIVE_RESTART, "0", "OpenGL or Native Vulkan, RTX cards, nvngx_dlss.dll next to the game.", false);
-#endif
+    B("dlss", "Graphics", "Graphics", "NVIDIA DLAA", LIVE_RESTART, "0", "OpenGL or Native Vulkan, RTX cards. Without nvngx_dlss.dll next to the game, use the Download NVIDIA DLSS button on the launcher's Graphics page.", false);
+    B("fsr_frame_generation", "Graphics", "Graphics", "AMD FSR frame generation", LIVE_RESTART, "0", "Native Vulkan only. Needs AMD's frame generation files: use the Download AMD FSR frame generation button on the launcher's Graphics page.", false);
     // Gameplay
     C("fps_limit", "Performance", "Gameplay", "Frame rate", LIVE_YES, "1", {{"1", "60 FPS (console)"}, {"120", "120 FPS"}, {"144", "144 FPS"}, {"240", "240 FPS"}, {"0", "Unlimited"}},
       "Above 60 is untested with Metroid Prime 4 Beyond: if the game runs too fast or stutters, go back to 60.");
@@ -527,9 +615,12 @@ static std::vector<Opt> build_options() {
     I("volume", "Audio", "Audio", "Master volume", LIVE_YES, "100", 0, 200, 5, "");
     B("audio_surround_downmix", "Performance", "Audio", "Mix all six surround channels into stereo (off drops the center channel: no dialogue)", LIVE_YES, "1", "");
     // Controls
-    B("mouse_aim", "Input", "Controls", "Mouse free aim", LIVE_YES, "1",
-      "Hold the right mouse button and move the mouse to aim in any direction. Left click shoots, middle click arms missiles.");
-    I("mouse_sensitivity", "Input", "Controls", "Mouse aim sensitivity", LIVE_YES, "100", 25, 400, 5, "Percent: higher turns the aim with less mouse movement.");
+    B("mouse_look", "Input", "Controls", "Mouse look", LIVE_YES, "1",
+      "The mouse turns the camera. Left click shoots, right click locks on, middle click fires missiles. F1 or switching windows frees the cursor.");
+    I("mouse_sensitivity", "Input", "Controls", "Mouse look sensitivity", LIVE_YES, "100", 25, 400, 5, "Percent: higher turns the camera further for the same mouse movement. At 100%, one mouse count turns it 0.05 degrees in first person.");
+    B("mouse_invert_y", "Input", "Controls", "Invert mouse up and down", LIVE_YES, "0", "");
+    I("mouse_deadzone", "Input", "Controls", "Mouse look starting push", LIVE_YES, "15", 0, 50, 1,
+      "Where the mouse moves the right stick (lock-on, morph ball, menus): percent of stick push any mouse movement starts from. Raise it if slow movement doesn't turn the camera, lower it if small movements turn it too far.");
     C("button_icons", "Input", "Controls", "Button icons", LIVE_RESTART, "auto",
       {{"auto", "Automatic"}, {"switch", "Switch (original)"}, {"xbox", "Xbox"}, {"ps4", "PlayStation 4"}, {"ps5", "PlayStation 5"}},
       "Automatic: from the controller connected when the game starts. Xbox controllers and the Steam Deck get Xbox icons, DualShock 4 PS4 icons, DualSense PS5 icons, Switch controllers the originals.");
@@ -550,10 +641,16 @@ static std::vector<Opt> build_options() {
     C("recording_fps", "Recording", "Advanced", "Recording FPS", LIVE_YES, "60", {{"30", "30"}, {"60", "60"}}, "");
     C("log", "Debug", "Advanced", "Log detail", LIVE_YES, "1", {{"1", "Normal"}, {"2", "Everything (slow)"}}, "");
     B("diag", "Debug", "Advanced", "Automatic diagnostic dumps", LIVE_YES, "0", "");
-    B("profile", "Debug", "Advanced", "CPU profiler (profile.txt every 10 s)", LIVE_RESTART, "0", "");
+    B("profile", "Debug", "Advanced", "CPU profiler (profile.txt every 10 s)", LIVE_RESTART, "0",
+      "With Native Vulkan, the GPU's time per rendering pass goes to the log too.");
     C("menu_shortcut", "Launcher", "Controls", "In-game menu button", LIVE_YES, "home", {{"home", "Home / Guide / PS"}, {"minus_plus", "- and + together"}, {"l3_r3", "L3 + R3 held 1 s"}},
       "F1 on the keyboard always opens the menu.");
     B("skip_launcher", "Launcher", "Advanced", "Skip the Play screen at start", LIVE_YES, "0", "Hold Shift while starting to see it again.", false);
+    // the launcher's look, which the in-game menu follows too (changed in the launcher only)
+    C("theme", "Launcher", "Display", "Launcher theme", LIVE_YES, "beyond",
+      {{"beyond", "Beyond (red and cyan)"}, {"amber", "Amber visor"}, {"contrast", "High contrast"}, {"custom", "Custom (theme.ini)"}},
+      "Custom reads theme.ini next to the game: colours as #RRGGBB.", false);
+    B("reduce_motion", "Launcher", "Display", "Reduce motion", LIVE_YES, "0", "Stops the turning rings in the background and the moving stripes on progress bars.", false);
     return o;
 }
 const std::vector<Opt>& options() { static std::vector<Opt> o = build_options(); return o; }

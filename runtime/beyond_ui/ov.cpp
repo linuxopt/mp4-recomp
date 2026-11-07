@@ -1,9 +1,10 @@
 // In-game menu: F1 (or the controller shortcut) opens it over the running game. Drawn with Dear ImGui's OpenGL3 backend on
-// the GL thread just before the swap (glq.c). The game keeps running at normal speed; while the menu is open it gets neutral
-// input, and after closing it gets input again only once every button is released (no stuck buttons).
+// the GL thread just before the swap (glq.c), or under renderer=vulkan_native by snxvk's overlay pipeline at each present
+// (ov_vk_frame, gpu/vk/ui.c). The game keeps running at normal speed; while the menu is open it gets neutral input, and
+// after closing it gets input again only once every button is released (no stuck buttons).
 // Threads: window thread -> ov_wndproc (keyboard, mouse); main thread -> ov_pad (controller, open/close, settings snapshot);
-// GL thread -> ov_gl_frame (drawing). They meet in g_q under its mutex. The window side: ov_wndproc on Windows, the
-// ov_input_* functions from the X11 backend on Linux (Steam Deck: touch arrives as the mouse).
+// drawing thread (GL, or snxvk's GPU thread) -> ov_gl_frame / ov_vk_frame. They meet in g_q under its mutex. The window
+// side: ov_wndproc on Windows, the ov_input_* functions from the X11 backend on Linux (Steam Deck: touch arrives as the mouse).
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -13,6 +14,7 @@
 #endif
 #include <mutex>
 #include <chrono>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -25,23 +27,27 @@
 #include "imgui_internal.h"
 #include "imgui_impl_opengl3.h"
 #include "ui.h"
+#include "ov_vk.h"
 
 extern "C" {
 void settings_queue(const char* k, const char* v);
 const char* settings_get(const char* k, const char* def);
+extern char g_exedir[1024];   // main.c: the game folder, with its trailing separator
 void backend_window_size(int* w, int* h);
 void* backend_gl_proc(const char* n);
 void gpu_gl_state_dirty(void);
 void backend_release_keys(void);
 void backend_request_quit(void);
 int backend_is_fullscreen(void);
-extern void (*g_backend_status)(const char*);
 extern int g_snxvk_on;
 extern int g_opt_ff;
 extern int g_frames;
 int cheats_count(void); int cheats_info(int i, char* name, int cap, int* on, int* master); void cheats_set(int i, int on);
 const char* cheats_path(void); void cheats_reload(void); int fov_available(void);
 void logf_(int lvl, const char* f, ...);
+int kbm_action_count(void); const char* kbm_action_key(int i); const char* kbm_action_label(int i); const char* kbm_action_default(int i);
+void kbm_binding_get(int i, char* out, int cap);
+void kbm_capture_begin(void); void kbm_capture_cancel(void); int kbm_capture_take(char* out, int cap);
 }
 using namespace ui;
 
@@ -66,7 +72,7 @@ bool g_latch, g_open_seen;                        // main thread: block the game
 Nav g_nav; double g_hold_t0;                      // main thread
 unsigned long long g_prev_phys;
 
-// GL thread
+// drawing thread
 bool g_ready; double g_t_open; int g_tab; bool g_tab_changed = true;
 std::map<std::string, std::string> g_vals;        // the menu's copy
 struct Revert { bool active = false; double t0 = 0; std::vector<std::pair<std::string, std::string>> old; } g_rev;
@@ -106,11 +112,96 @@ void opt_row(const char* key) {
         float v = (float)atof(cur.c_str());
         std::string t = o->type == OPT_INT ? fmt("%d", (int)lroundf(v)) : fmt("%.2f", v);
         if (!strcmp(key, "resolution")) { bool d = val("docked") == "1"; t = res_text(v, d, ""); }
-        if (!strcmp(key, "mouse_sensitivity")) t = fmt("%d%%", (int)lroundf(v));
+        if (!strcmp(key, "mouse_sensitivity") || !strcmp(key, "mouse_deadzone")) t = fmt("%d%%", (int)lroundf(v));
         if (!strcmp(key, "volume") || !strcmp(key, "rumble")) t = (int)v == 0 ? "Off" : fmt("%d%%", (int)lroundf(v));
         if (!strcmp(key, "stick_deadzone")) t = fmt("%d%%", (int)(v * 100 / 32767));
         if (row_slider(id.c_str(), o->label, &v, o->lo, o->hi, o->step, t.c_str(), tag)) commit(o->type == OPT_INT ? fmt("%d", (int)lroundf(v)) : fmt("%g", roundf(v * 100) / 100));
     } }
+}
+
+// ---- keyboard bindings (input_kbm.c): a row per Switch button; selecting it waits for a key, which is added to that
+// button or, if the button already has it, taken off. A key added here leaves any other button it was on
+int g_cap_action = -1; double g_cap_t0; std::string g_bind_note;
+
+std::vector<std::string> chord_list(const std::string& v) {
+    std::vector<std::string> out; size_t i = 0;
+    while (i <= v.size()) {
+        size_t e = v.find(',', i); if (e == std::string::npos) e = v.size();
+        std::string t = v.substr(i, e - i); size_t a = t.find_first_not_of(" \t"), b = t.find_last_not_of(" \t");
+        if (a != std::string::npos) { t = t.substr(a, b - a + 1); if (t != "-") out.push_back(t); }
+        i = e + 1;
+    }
+    return out;
+}
+std::string chord_join(const std::vector<std::string>& l) {
+    std::string s; for (auto& c : l) { if (!s.empty()) s += ", "; s += c; }
+    return s.empty() ? "-" : s;
+}
+bool chord_eq(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); i++) if (tolower((unsigned char)a[i]) != tolower((unsigned char)b[i])) return false;
+    return true;
+}
+std::string binding(int i) {
+    auto it = g_vals.find(kbm_action_key(i)); if (it != g_vals.end()) return it->second;
+    char b[128]; kbm_binding_get(i, b, sizeof b); return b;
+}
+void binding_toggle(int action, const std::string& chord) {
+    std::vector<std::string> l = chord_list(binding(action));
+    auto has = std::find_if(l.begin(), l.end(), [&](const std::string& c) { return chord_eq(c, chord); });
+    if (has != l.end()) { l.erase(has); change(kbm_action_key(action), chord_join(l)); g_bind_note = chord + " taken off " + kbm_action_label(action); return; }
+    g_bind_note = chord + " now presses " + kbm_action_label(action);
+    for (int j = 0; j < kbm_action_count(); j++) {
+        if (j == action) continue;
+        std::vector<std::string> o = chord_list(binding(j));
+        auto it = std::find_if(o.begin(), o.end(), [&](const std::string& c) { return chord_eq(c, chord); });
+        if (it == o.end()) continue;
+        o.erase(it); change(kbm_action_key(j), chord_join(o)); g_bind_note += std::string(" (moved from ") + kbm_action_label(j) + ")";
+    }
+    l.push_back(chord); change(kbm_action_key(action), chord_join(l));
+}
+void capture_cancel() { if (g_cap_action >= 0) kbm_capture_cancel(); g_cap_action = -1; }
+void capture_poll(double t) {   // each menu frame
+    if (g_cap_action < 0) return;
+    char c[64];
+    if (kbm_capture_take(c, sizeof c)) { int a = g_cap_action; g_cap_action = -1; if (c[0]) binding_toggle(a, c); }
+    else if (t - g_cap_t0 > 8) { capture_cancel(); g_bind_note = "No key pressed: nothing changed"; }
+}
+
+// [Input] mouse_buttons: left, right, middle, back, forward as Switch buttons (input_kbm.c mouse_map)
+const char* const MOUSE_ROWS[] = {"Left mouse button", "Right mouse button", "Middle mouse button", "Back mouse button", "Forward mouse button"};
+const Choice MOUSE_TARGETS[] = {{"-", "None"}, {"a", "A"}, {"b", "B"}, {"x", "X"}, {"y", "Y"}, {"l", "L"}, {"r", "R"}, {"zl", "ZL"}, {"zr", "ZR"},
+                                {"plus", "+"}, {"minus", "-"}, {"lstick", "Left stick click"}, {"rstick", "Right stick click"}};
+void mouse_rows() {
+    std::vector<std::string> cur = chord_list(val("mouse_buttons")); cur.resize(5, "-");
+    std::vector<std::string> items; for (auto& c : MOUSE_TARGETS) items.push_back(c.label);
+    for (int i = 0; i < 5; i++) {
+        int idx = 0; for (int j = 0; j < (int)items.size(); j++) if (chord_eq(cur[i], MOUSE_TARGETS[j].value)) idx = j;
+        if (row_choice(fmt("##mb%d", i).c_str(), MOUSE_ROWS[i], &idx, items)) {
+            cur[i] = MOUSE_TARGETS[idx].value; std::string v; for (int k = 0; k < 5; k++) { if (k) v += ","; v += cur[k]; }
+            change("mouse_buttons", v);
+        }
+    }
+}
+
+void keyboard_rows() {
+    for (int i = 0; i < kbm_action_count(); i++) {
+        if (i == 12) section("KEYBOARD: D-PAD AND STICKS");
+        bool waiting = g_cap_action == i;
+        std::string v = waiting ? "PRESS A KEY (ESC CANCELS)" : chord_join(chord_list(binding(i)));
+        if (v == "-") v = "NONE";
+        if (row_button(fmt("##kb%d", i).c_str(), kbm_action_label(i), v.c_str(), waiting)) {
+            if (waiting) capture_cancel();
+            else { capture_cancel(); g_cap_action = i; g_cap_t0 = ImGui::GetTime(); kbm_capture_begin(); g_bind_note.clear(); }
+        }
+    }
+    if (row_button("##kbreset", "Keyboard and mouse buttons back to the defaults", "RESET")) {
+        capture_cancel();
+        for (int i = 0; i < kbm_action_count(); i++) change(kbm_action_key(i), kbm_action_default(i));
+        change("mouse_buttons", "a,zl,r,-,-"); g_bind_note = "Keyboard and mouse buttons reset";
+    }
+    help_text(g_bind_note.empty() ? "Select a button, then press the key for it (Shift, Ctrl or Alt held with it make a chord). Pressing a key the button "
+                                    "already has takes it off. Esc, F1-F12 stay with the game window." : g_bind_note.c_str());
 }
 
 void tab_content(int t) {
@@ -135,14 +226,14 @@ void tab_content(int t) {
         help_text("Cheats that change game data work; cheats that patch game code (ARM instructions) do nothing, the code is recompiled.");
         break; }
     case 4: section("OUTPUT"); opt_row("volume"); section("COMPATIBILITY"); opt_row("audio_surround_downmix"); break;
-    case 5: section("MOUSE"); opt_row("mouse_aim"); opt_row("mouse_sensitivity");
+    case 5: section("KEYBOARD: BUTTONS"); keyboard_rows();
+            section("MOUSE"); opt_row("mouse_look"); opt_row("mouse_sensitivity"); opt_row("mouse_invert_y"); opt_row("mouse_deadzone"); mouse_rows();
             section("CONTROLLER"); opt_row("button_icons"); opt_row("stick_deadzone"); opt_row("rumble"); opt_row("menu_shortcut"); opt_row("controller_api");
             help_text("Button mapping and menu buttons are on the Play screen's Controls page."); break;
     default: {
         section("KEYS");
         const char* kb[][2] = {{"Menu", "F1"}, {"Screenshot", "F3 (F8: full resolution PNG)"}, {"Record video", "F7"}, {"Fullscreen", "F11 or Alt+Enter"},
-                               {"Fast forward (if on)", "Tab, or L3 + R3"}, {"Quit", "Esc"}, {"Move / aim", "W A S D / I J K L"}, {"A B X Y", "X  Z  C  V"},
-                               {"L R ZL ZR", "Q  E  1  3"}, {"+ / -", "Enter / Backspace"}};
+                               {"Fast forward (if on)", "Tab, or L3 + R3"}, {"Quit", "Esc"}, {"Game buttons", "Controls tab (PrimeHack-style by default)"}};
         for (auto& r : kb) row_text(r[0], r[1]);
         section("ABOUT"); help_text("Metroid Prime 4 Recomp: Metroid Prime 4 Beyond recompiled for PC. SwitchRecomp by MZ Labs; Native Vulkan by ScarletNX; Dear ImGui; SDL2. Full credits on the Play screen.");
     } }
@@ -166,7 +257,7 @@ void draw_menu(float W, float H, double t) {
         ImVec2 ts = ImGui::GetFont()->CalcTextSizeA(S(19), FLT_MAX, 0, TABS[i]); ImVec2 a(tx, p.y + S(6)), b(tx + ts.x + S(28), p.y + S(40));
         ImGui::SetCursorScreenPos(a); if (ImGui::InvisibleButton(fmt("##tab%d", i).c_str(), {b.x - a.x, b.y - a.y}, ImGuiButtonFlags_None)) { g_tab = i; g_tab_changed = true; }
         bool sel = g_tab == i;
-        if (sel) chamfer_rect(dl, a, b, S(6), IM_COL32(226, 30, 44, 200), 0); else if (ImGui::IsItemHovered()) chamfer_rect(dl, a, b, S(6), IM_COL32(64, 214, 255, 30), 0);
+        if (sel) chamfer_rect(dl, a, b, S(6), alpha(C_RED, 200), 0); else if (ImGui::IsItemHovered()) chamfer_rect(dl, a, b, S(6), alpha(C_CYAN, 30), 0);
         dl->AddText(ImGui::GetFont(), S(19), {a.x + S(14), a.y + S(7)}, sel ? IM_COL32(255, 255, 255, 255) : C_DIM, TABS[i]);
         tx = b.x + S(6);
     }
@@ -213,16 +304,14 @@ void snapshot_settings() {   // main thread
     bindings_from_string(settings_get("launcher_bindings", "1,0,6,7,10"), g_q.bind);
     g_q.nav_on = strcmp(settings_get("launcher_nav", "1"), "0") != 0; g_q.prompts = prompt_style_from(settings_get("launcher_prompts", "auto"));
     g_q.renderer = settings_get("renderer", "opengl");
+    g_q.vals["mouse_buttons"] = settings_get("mouse_buttons", "a,zl,r,-,-");
 }
 } // namespace
 
 // ---------------------------------------------------------------- window thread
 extern "C" int ov_is_open(void) { return g_q.open ? 1 : 0; }
 /* the window side, any platform: F1 (toggle) and, while the menu is open, keys, characters and the mouse */
-extern "C" void ov_input_toggle(void) {
-    if (g_snxvk_on) { if (g_backend_status) g_backend_status("The in-game menu needs the OpenGL renderer for now (Play screen > Graphics)"); return; }
-    Lock k; g_q.want_toggle = true;
-}
+extern "C" void ov_input_toggle(void) { Lock k; g_q.want_toggle = true; }
 extern "C" void ov_input_key(int ovk, int down) { if (!g_q.open || !ovk) return; Lock k; g_q.ev.push_back({0, ovk, down != 0}); }
 extern "C" void ov_input_char(unsigned c) { if (!g_q.open) return; Lock k; g_q.ev.push_back({1, (int)c, 0}); }
 extern "C" void ov_input_mouse(float x, float y) { if (!g_q.open) return; Lock k; g_q.ev.push_back({2, 0, 0, x, y}); }
@@ -263,7 +352,6 @@ extern "C" int ov_pad(unsigned long long phys, int lx, int ly) {
     if (sc == "minus_plus" && (phys >> 10 & 1) && (phys >> 11 & 1) && ((pressed >> 10 & 1) || (pressed >> 11 & 1))) toggle = true;
     if (sc == "l3_r3") { bool both = (phys >> 4 & 1) && (phys >> 5 & 1); if (both) { if (!g_hold_t0) g_hold_t0 = now; else if (g_hold_t0 > 0 && now - g_hold_t0 >= 1.0) { toggle = true; g_hold_t0 = -1; } } else g_hold_t0 = 0; }
     g_prev_phys = phys;
-    if (toggle && g_snxvk_on) { if (g_backend_status) g_backend_status("The in-game menu needs the OpenGL renderer for now (Play screen > Graphics)"); toggle = false; }
     bool open;
     { Lock k; if (toggle) { if (!g_q.open) { g_q.m.unlock(); snapshot_settings(); g_q.m.lock(); g_q.open = true; backend_release_keys(); logf_(1, "menu: opened at frame %d\n", g_frames); } else g_q.open = false; } open = g_q.open; }
     if (open) {
@@ -271,7 +359,7 @@ extern "C" int ov_pad(unsigned long long phys, int lx, int ly) {
         { Lock k; memcpy(g_nav.bind, g_q.bind, sizeof g_nav.bind); g_nav.enabled = g_q.nav_on; }
         if (g_nav.reset_hold(now, phys)) settings_queue("launcher_bindings", "1,0,6,7,10");
         g_nav.update(phys & ~(1ull << 30), lx, ly, now);
-        Lock k;   // edges accumulate until the GL thread takes them
+        Lock k;   // edges accumulate until the drawing thread takes them
         g_q.up |= g_nav.up; g_q.down |= g_nav.down; g_q.left |= g_nav.left; g_q.right |= g_nav.right;
         for (int i = 0; i < NAV_COUNT; i++) g_q.act[i] |= g_nav.act[i];
         if (g_nav.any_pad) g_q.pad_used = true;
@@ -301,8 +389,10 @@ static void test_window_shot() {
     gpu_gl_state_dirty();
 }
 
-extern "C" void ov_gl_frame(void) {
-    test_window_shot();
+// one menu frame for either renderer, w x h the window: its input, the widgets, ImGui::Render. False while it is closed.
+// OpenGL draws with ImGui's OpenGL3 backend; native Vulkan (ov_vk_frame) hands the draw data to snxvk, which makes the
+// textures itself (ImGuiBackendFlags_RendererHasTextures)
+static bool menu_frame(int w, int h) {
     bool open; std::vector<Ev> ev; bool up, down, left, right, act[NAV_COUNT];
     {
         Lock k; open = g_q.open; ev.swap(g_q.ev);
@@ -311,18 +401,22 @@ extern "C" void ov_gl_frame(void) {
         if (open && !g_ready) {}   // first open below
         if (open && g_vals.empty()) g_vals = g_q.vals;
     }
-    static bool was_open;
-    if (!open) { if (was_open) { was_open = false; g_vals.clear(); g_rev.active = false; g_quit_confirm = false; } return; }
-    if (!was_open) { was_open = true; g_t_open = ImGui::GetCurrentContext() ? ImGui::GetTime() : 0; g_tab_changed = true; { Lock k; g_vals = g_q.vals; } }
+    static bool was_open, need_theme;
+    if (!open) { if (was_open) { was_open = false; g_vals.clear(); g_rev.active = false; g_quit_confirm = false; capture_cancel(); g_bind_note.clear(); } return false; }
+    if (!was_open) { was_open = true; need_theme = true; g_t_open = ImGui::GetCurrentContext() ? ImGui::GetTime() : 0; g_tab_changed = true; { Lock k; g_vals = g_q.vals; } }
     if (!g_ready) {
         IMGUI_CHECKVERSION(); ImGui::CreateContext(); ImGuiIO& io = ImGui::GetIO();
         io.IniFilename = nullptr; io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_NavEnableGamepad; io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
         load_fonts(io); apply_style(1.0f);
-        if (!ImGui_ImplOpenGL3_Init(nullptr)) { ImGui::DestroyContext(); Lock k; g_q.open = false; return; }
+        if (g_snxvk_on) { io.BackendRendererName = "snxvk"; io.BackendFlags |= ImGuiBackendFlags_RendererHasTextures | ImGuiBackendFlags_RendererHasVtxOffset; }
+        else if (!ImGui_ImplOpenGL3_Init(nullptr)) { ImGui::DestroyContext(); Lock k; g_q.open = false; return false; }
         g_ready = true; g_t_open = ImGui::GetTime();
     }
+    if (need_theme) {   // the launcher's theme, read each time the menu opens (theme.ini may have changed)
+        need_theme = false;
+        theme_apply(g_vals["theme"], std::string(g_exedir) + "theme.ini", nullptr); g_reduce_motion = g_vals["reduce_motion"] == "1";
+    }
     ImGuiIO& io = ImGui::GetIO();
-    int w = 1, h = 1; backend_window_size(&w, &h);
     io.DisplaySize = ImVec2((float)w, (float)h);
     static double last; double now = now_s();
     io.DeltaTime = last > 0 ? std::max(1e-4f, (float)(now - last)) : 1.0f / 60; last = now;
@@ -338,22 +432,33 @@ extern "C" void ov_gl_frame(void) {
             if (key != ImGuiKey_None) io.AddKeyEvent(key, e.b != 0); break; }
         case 1: io.AddInputCharacter((unsigned)e.a); break;
         case 2: io.AddMousePosEvent(e.x, e.y); break;
-        case 3: io.AddMouseButtonEvent(e.a, e.b != 0); break;
+        case 3: if (e.b && g_cap_action >= 0) capture_cancel(); io.AddMouseButtonEvent(e.a, e.b != 0); break;
         case 4: io.AddMouseWheelEvent(0, e.y); break;
         }
     }
     float sc = std::max(0.55f, std::min(2.2f, std::min(h / 1080.0f, w / 1700.0f))); if (fabsf(sc - g_scale) > 0.01f) apply_style(sc);
-    ImGui_ImplOpenGL3_NewFrame(); ImGui::NewFrame();
+    if (!g_snxvk_on) ImGui_ImplOpenGL3_NewFrame();
+    ImGui::NewFrame();
     nav_frame_begin();
     g_row.pad_left = left || ImGui::IsKeyPressed(ImGuiKey_LeftArrow); g_row.pad_right = right || ImGui::IsKeyPressed(ImGuiKey_RightArrow); g_row.confirm = act[NAV_CONFIRM];
     if (g_rev.active && act[NAV_CONFIRM]) { g_rev.active = false; g_row.confirm = false; }   // "Keep these display settings?": confirm keeps
     bool close = act[NAV_BACK] || ImGui::IsKeyPressed(ImGuiKey_Escape);
+    capture_poll(ImGui::GetTime());
+    if (close && g_cap_action >= 0) { capture_cancel(); close = false; g_bind_note = "Cancelled: nothing changed"; }
     if (close) { if (g_rev.active) revert_display(); else { Lock k; g_q.open = false; } }
     if (act[NAV_PREV] || ImGui::IsKeyPressed(ImGuiKey_PageUp)) { g_tab = (g_tab + NTABS - 1) % NTABS; g_tab_changed = true; }
     if (act[NAV_NEXT] || ImGui::IsKeyPressed(ImGuiKey_PageDown)) { g_tab = (g_tab + 1) % NTABS; g_tab_changed = true; }
     draw_menu((float)w, (float)h, ImGui::GetTime());
     if (!g_rev.active) nav_move(down ? 1 : up ? -1 : 0);   // controller up/down (keyboard arrows use ImGui's own nav)
     ImGui::Render();
+    return true;
+}
+
+extern "C" void ov_gl_frame(void) {
+    if (g_snxvk_on) return;   // the native Vulkan renderer draws the menu (ov_vk_frame)
+    test_window_shot();
+    int w = 1, h = 1; backend_window_size(&w, &h);
+    if (!menu_frame(w, h)) return;
     // draw into the window's framebuffer (with renderer=vulkan the runtime redirects framebuffer 0 to the image Vulkan presents)
     typedef void (APIENTRY * BindFB)(unsigned, unsigned); typedef void (APIENTRY * GetI)(unsigned, int*); typedef void (APIENTRY * Clip)(unsigned, unsigned);
     typedef void (APIENTRY * En)(unsigned); typedef unsigned char (APIENTRY * IsEn)(unsigned); typedef void (APIENTRY * VP)(int, int, int, int);
@@ -374,4 +479,54 @@ extern "C" void ov_gl_frame(void) {
         if (want && rp) { std::vector<unsigned char> px((size_t)w * h * 3); rp(0, 0, w, h, 0x1907, 0x1401, px.data());
           std::string path = fmt("%s-m%d.ppm", pre, n); FILE* f = fopen(path.c_str(), "wb");
           if (f) { fprintf(f, "P6\n%d %d\n255\n", w, h); for (int y = h - 1; y >= 0; y--) fwrite(&px[(size_t)y * w * 3], 1, (size_t)w * 3, f); fclose(f); } } } }
+}
+
+// ---------------------------------------------------------------- native Vulkan (snxvk gpu/vk/ui.c, each present)
+// The menu's draw data for snxvk's overlay pipeline (ov_vk.h). ImGui's vertices already have its layout (x y u v, R G B A
+// bytes); the textures (the font atlas) are made and changed there, whole, when ImGui asks
+static_assert(sizeof(ImDrawVert) == 20 && sizeof(ImDrawIdx) == 2, "ov_vk.h: 20-byte vertices, 16-bit indices");
+extern "C" int ov_vk_frame(OvVkDraw* d) {
+    static std::vector<ImDrawVert> vtx; static std::vector<ImDrawIdx> idx; static std::vector<OvVkCmd> cmd;
+    static std::vector<OvVkTex> tex; static std::vector<std::vector<unsigned char>> rgba; static unsigned next_id;
+    memset(d, 0, sizeof *d);
+    if (!g_snxvk_on) return 0;
+    int w = 1, h = 1; backend_window_size(&w, &h);
+    if (!menu_frame(w, h)) return 0;
+    ImDrawData* dd = ImGui::GetDrawData();
+    tex.clear();
+    if (dd->Textures) {
+        rgba.resize((size_t)dd->Textures->Size);
+        for (int i = 0; i < dd->Textures->Size; i++) {
+            ImTextureData* t = (*dd->Textures)[i];
+            if (t->Status == ImTextureStatus_OK || t->Status == ImTextureStatus_Destroyed) continue;
+            if (t->Status == ImTextureStatus_WantDestroy) {   // snxvk frees it once the frames using it are done
+                if (t->TexID != ImTextureID_Invalid) tex.push_back({(unsigned)t->TexID, OV_VK_TEX_DESTROY, 0, 0, nullptr});
+                t->SetTexID(ImTextureID_Invalid); t->SetStatus(ImTextureStatus_Destroyed); continue;
+            }
+            const unsigned char* px = (const unsigned char*)t->GetPixels();
+            if (t->Format == ImTextureFormat_Alpha8) {   // white with that coverage
+                std::vector<unsigned char>& c = rgba[(size_t)i]; c.resize((size_t)t->Width * t->Height * 4);
+                for (size_t k = 0, n = (size_t)t->Width * t->Height; k < n; k++) { c[k * 4] = c[k * 4 + 1] = c[k * 4 + 2] = 255; c[k * 4 + 3] = px[k]; }
+                px = c.data();
+            }
+            bool create = t->Status == ImTextureStatus_WantCreate || t->TexID == ImTextureID_Invalid;
+            if (create) t->SetTexID((ImTextureID)++next_id);
+            tex.push_back({(unsigned)t->TexID, create ? OV_VK_TEX_CREATE : OV_VK_TEX_UPDATE, t->Width, t->Height, px});
+            t->SetStatus(ImTextureStatus_OK);
+        }
+    }
+    vtx.clear(); idx.clear(); cmd.clear();
+    for (const ImDrawList* l : dd->CmdLists) {   // one buffer for all; DisplayPos is 0,0 (no extra viewports)
+        unsigned vb = (unsigned)vtx.size(), ib = (unsigned)idx.size();
+        vtx.insert(vtx.end(), l->VtxBuffer.begin(), l->VtxBuffer.end());
+        idx.insert(idx.end(), l->IdxBuffer.begin(), l->IdxBuffer.end());
+        for (const ImDrawCmd& c : l->CmdBuffer) {
+            if (c.UserCallback || !c.ElemCount) continue;   // the menu sets no callbacks
+            cmd.push_back({{c.ClipRect.x, c.ClipRect.y, c.ClipRect.z, c.ClipRect.w}, (unsigned)c.GetTexID(), ib + c.IdxOffset, c.ElemCount, (int)(vb + c.VtxOffset)});
+        }
+    }
+    d->w = dd->DisplaySize.x; d->h = dd->DisplaySize.y;
+    d->vtx = vtx.data(); d->nvtx = (unsigned)vtx.size(); d->idx = idx.data(); d->nidx = (unsigned)idx.size();
+    d->cmd = cmd.data(); d->ncmd = (unsigned)cmd.size(); d->tex = tex.data(); d->ntex = (unsigned)tex.size();
+    return 1;
 }

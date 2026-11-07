@@ -6,6 +6,14 @@
    loop (window, input, vsync). */
 #include "rt.h"
 #include <sys/stat.h>
+#include "input_kbm.h"
+#define KBM_INI_HELP \
+  "; Keyboard: key_<button> = keys or chords, comma separated (key_x=E, Alt). A chord is keys held together,\n" \
+  ";   joined by + (key_y=Shift+1); - = none. Keys: A-Z 0-9 Space Enter Backspace Tab Grave (left of 1) Shift Ctrl\n" \
+  ";   Alt CapsLock Insert Delete Home End PageUp PageDown Up Down Left Right Dash Equals LBracket RBracket Backslash\n" \
+  ";   Semicolon Apostrophe Comma Period Slash Num0-Num9 NumAdd NumSub NumMul NumDiv NumDecimal. Punctuation keys go\n" \
+  ";   by their place on a US keyboard. Esc and F1-F12 stay with the game window (quit, menu, screenshots...); Tab is\n" \
+  ";   fast forward while fast_forward=1. The in-game menu (F1 > Controls) rebinds them by pressing the key\n"
 
 const SwrModule* g_mod;
 GuestFn* g_disp;
@@ -18,25 +26,26 @@ int g_present_pacing_candidate;
 int g_opt_audio_surround_downmix=1;   /* Prime 4 mixes in 5.1 with dialogue in the center channel: front-only stereo dropped the voices */
 /* FPS counter ([Graphics] show_fps): a seven-segment "123 FPS" in the top-left corner as plain rectangles, so every
    build and renderer can draw it with clears (gpu_gl.c window pass, snxvk hdr.c present pass). Counted from presents,
-   i.e. the frames that reach the screen, over half a second. Each rect: x, y (top-left origin), w, h, 0 back / 1 text */
+   i.e. the frames that reach the screen, over half a second. Each rect: x, y (top-left origin), w, h, 0 back / 1 text.
+   With FSR frame generation running it counts presents of the game's own frames only, so it shows two rows: what
+   reaches the screen (those plus the generated ones) as "FPS", and under it what the game rendered as "rEnd" */
 int g_opt_show_fps=0;
+volatile unsigned long long g_fg_generated_frames;   /* frames FSR frame generation made so far (snxvk fsr_fg.c) */
+static int g_fps_rows=1;
+int fps_overlay_rows(void){ return g_opt_show_fps ? g_fps_rows : 0; }   /* snxvk hdr.c: its skip prompt goes below */
 volatile int g_skip_prompt;            /* the native Vulkan renderer's top-left prompt overlay (snxvk hdr.c): nothing sets it */
 volatile float g_skip_hold;
 static void env_switch(const char* name, int on);
-int fps_overlay_rects(int W,int H,int (*r)[5],int max){
-  static u64 t0;static u32 frames;static int fps=-1;
-  if(!g_opt_show_fps){t0=0;frames=0;fps=-1;return 0;}
-  u64 now=plat_ns();if(!t0)t0=now;else frames++;
-  if(now-t0>=500000000ull){fps=(int)(((u64)frames*2000000000ull/(now-t0)+1)/2);t0=now;frames=0;}
+/* one row of seven-segment glyphs, its back first; returns the new rect count */
+static int fps_row(int (*r)[5],int n,int max,int x0,int y0,float s,int value,const u8* label,int nl){
   static const u8 digit[10]={0x3F,0x06,0x5B,0x4F,0x66,0x6D,0x7D,0x07,0x7F,0x6F};
-  u8 glyph[8];int ng=0;
-  if(fps<0)glyph[ng++]=0x40;
-  else{char t[8];int k=snprintf(t,sizeof t,"%d",fps>999?999:fps);for(int i=0;i<k;i++)glyph[ng++]=digit[t[i]-'0'];}
-  glyph[ng++]=0;glyph[ng++]=0x71;glyph[ng++]=0x73;glyph[ng++]=0x6D;   /* space F P S */
-  float s=(float)H/1080.f;if(s<0.5f)s=0.5f;(void)W;
-  int dh=(int)(26*s+0.5f),dw=(int)(14*s+0.5f),t=(int)(3*s+0.5f),gap=(int)(6*s+0.5f),pad=(int)(8*s+0.5f),x0=(int)(16*s+0.5f),y0=x0;
+  u8 glyph[12];int ng=0;
+  if(value<0)glyph[ng++]=0x40;
+  else{char t[8];int k=snprintf(t,sizeof t,"%d",value>999?999:value);for(int i=0;i<k;i++)glyph[ng++]=digit[t[i]-'0'];}
+  glyph[ng++]=0;for(int i=0;i<nl;i++)glyph[ng++]=label[i];
+  int dh=(int)(26*s+0.5f),dw=(int)(14*s+0.5f),t=(int)(3*s+0.5f),gap=(int)(6*s+0.5f),pad=(int)(8*s+0.5f);
   if(t<2)t=2;
-  int n=0,total=ng*dw+(ng-1)*gap;
+  int total=ng*dw+(ng-1)*gap;
   if(n<max){r[n][0]=x0-pad;r[n][1]=y0-pad;r[n][2]=total+2*pad;r[n][3]=dh+2*pad;r[n][4]=0;n++;}
   int half=dh/2;
   for(int i=0;i<ng;i++){int x=x0+i*(dw+gap),y=y0;
@@ -44,12 +53,29 @@ int fps_overlay_rects(int W,int H,int (*r)[5],int max){
     for(int k=0;k<7&&n<max;k++)if(glyph[i]>>k&1){r[n][0]=seg[k][0];r[n][1]=seg[k][1];r[n][2]=seg[k][2];r[n][3]=seg[k][3];r[n][4]=1;n++;}}
   return n;
 }
+int fps_overlay_rects(int W,int H,int (*r)[5],int max){
+  static u64 t0,g0;static u32 frames;static int fps=-1,shown=-1;
+  if(!g_opt_show_fps){t0=0;frames=0;fps=-1;shown=-1;g_fps_rows=1;return 0;}
+  u64 now=plat_ns();if(!t0){t0=now;g0=g_fg_generated_frames;}else frames++;
+  if(now-t0>=500000000ull){
+    u64 g=g_fg_generated_frames;
+    fps=(int)(((u64)frames*2000000000ull/(now-t0)+1)/2);
+    shown=g!=g0?fps+(int)(((g-g0)*2000000000ull/(now-t0)+1)/2):-1;   /* -1: no frame generated in the half second */
+    t0=now;frames=0;g0=g;}
+  static const u8 FPS[3]={0x71,0x73,0x6D},REND[4]={0x50,0x79,0x54,0x5E};   /* F P S, r E n d */
+  float s=(float)H/1080.f;if(s<0.5f)s=0.5f;(void)W;
+  int x0=(int)(16*s+0.5f),y0=x0,n=0;
+  if(shown<0){g_fps_rows=1;return fps_row(r,n,max,x0,y0,s,fps,FPS,3);}
+  g_fps_rows=2;
+  n=fps_row(r,n,max,x0,y0,s,shown,FPS,3);
+  return fps_row(r,n,max,x0,y0+(int)(52*s+0.5f),s,fps,REND,4);
+}
 int g_opt_audio_eos_sample_count=1;   /* always on (cinematic clock ~2x and cut music without it); SWR_AUDIO_OLD_EOS=1 = off, tests only */
 char g_opt_pad_map[128]="";   /* physical-position button remapping, empty = identity */
 int g_opt_ctrl_api=0, g_opt_ctrl_index=0, g_opt_deadzone=7000;
 char g_opt_button_icons[16]="auto";
-int g_opt_mouse_aim=1, g_opt_mouse_sens=100;   /* [Input] mouse free aim (backend_win32.c mouse_apply) */
-char g_opt_mouse_buttons[64]="y,l,r,-,-";   /* left, right, middle, back, forward -> Switch buttons */   /* [Input] button_icons: auto, switch, xbox, ps4, ps5 (svc_fs.c romfs_apply_mods) */   /* [Input]: api 0 auto, 1 SDL2, 2 XInput */
+int g_opt_mouse_look=1, g_opt_mouse_sens=100, g_opt_mouse_invert_y=0, g_opt_mouse_deadzone=15;   /* [Input] mouse look (input_kbm.c) */
+char g_opt_mouse_buttons[64]="a,zl,r,-,-";   /* left, right, middle, back, forward -> Switch buttons */   /* [Input] button_icons: auto, switch, xbox, ps4, ps5 (svc_fs.c romfs_apply_mods) */   /* [Input]: api 0 auto, 1 SDL2, 2 XInput */
 int g_opt_diag=0;
 /* vsync: on by default off Windows. Without it the 60.00 FPS limiter beats against the display (59.95 Hz here): about once a
    second a frame came in the same refresh as the one before and the next refresh showed the old one again (59 of 3600
@@ -250,11 +276,12 @@ static const char* const INI_ALIAS[][2]={
   {"perfil","profile"},{"compilador_prioridad_baja","low_priority_shader_compiler"},{"vsync_forzado","forced_vsync"},
   {"grabacion_fluida","smooth_recording"},{"grabacion_fps","recording_fps"},{"lsfg_objetivo","lsfg_target"},
   {"lsfg_multiplicador","lsfg_multiplier"},{"lsfg_flujo","lsfg_flow"},{"lsfg_resolucion","lsfg_resolution"},
-  {"lossless_ruta","lossless_path"},{"controles","touch_controls"},{"controles_opacidad","touch_controls_opacity"},{NULL,NULL}};
+  {"lossless_ruta","lossless_path"},{"controles","touch_controls"},{"controles_opacidad","touch_controls_opacity"},
+  {"mouse_aim","mouse_look"},{NULL,NULL}};   /* mouse_aim: the Metroid Dread mouse free aim that mouse look replaced */
 
 static const char* ini_norm(const char* k){ for(int i=0;INI_ALIAS[i][0];i++) if(!strcmp(k,INI_ALIAS[i][0])) return INI_ALIAS[i][1]; return k; }
 /* everything we read, so the rewrite keeps unknown keys */
-#define INI_MAXK 128
+#define INI_MAXK 256
 static char g_ini_k[INI_MAXK][64], g_ini_v[INI_MAXK][1024]; static int g_ini_n;
 
 static void ini_store(const char* k, const char* v){ for(int i=0;i<g_ini_n;i++) if(!strcmp(g_ini_k[i],k)){ strncpy(g_ini_v[i],v,1023); return; }
@@ -266,9 +293,15 @@ static void env_switch(const char* name, int on);
 static void ini_apply(const char* k, const char* v){
     if(!strcmp(k,"docked")) g_opt_docked=atoi(v);
     else if(!strcmp(k,"controller_map")){ snprintf(g_opt_pad_map,sizeof g_opt_pad_map,"%s",v); }
-    else if(!strcmp(k,"mouse_aim")) g_opt_mouse_aim=atoi(v)!=0;
+    else if(!strcmp(k,"mouse_look")) g_opt_mouse_look=atoi(v)!=0;
     else if(!strcmp(k,"mouse_sensitivity")){ g_opt_mouse_sens=atoi(v); if(g_opt_mouse_sens<10) g_opt_mouse_sens=10; if(g_opt_mouse_sens>1000) g_opt_mouse_sens=1000; }
-    else if(!strcmp(k,"mouse_buttons")){ snprintf(g_opt_mouse_buttons,sizeof g_opt_mouse_buttons,"%s",v); extern void mouse_map_reset(void); mouse_map_reset(); }
+    else if(!strcmp(k,"mouse_invert_y")) g_opt_mouse_invert_y=atoi(v)!=0;
+    else if(!strcmp(k,"mouse_deadzone")){ g_opt_mouse_deadzone=atoi(v); if(g_opt_mouse_deadzone<0) g_opt_mouse_deadzone=0; if(g_opt_mouse_deadzone>50) g_opt_mouse_deadzone=50; }
+    else if(!strcmp(k,"mouse_buttons")){
+      /* the Metroid Dread layout (left Y, right L for its free aim) means nothing in a first-person game: the current default */
+      if(!strcmp(v,"y,l,r,-,-")){ v="a,zl,r,-,-"; ini_store(k,v); }
+      snprintf(g_opt_mouse_buttons,sizeof g_opt_mouse_buttons,"%s",v); extern void mouse_map_reset(void); mouse_map_reset(); }
+    else if(!strncmp(k,"key_",4) && kbm_binding_set(k,v)) {}   /* input_kbm.c keyboard bindings, live */
     else if(!strcmp(k,"button_icons")) snprintf(g_opt_button_icons,sizeof g_opt_button_icons,"%s",v);
     else if(!strcmp(k,"controller_api")) g_opt_ctrl_api= !strcmp(v,"sdl")? 1 : !strcmp(v,"xinput")? 2 : 0;
     else if(!strcmp(k,"controller_index")){ g_opt_ctrl_index=atoi(v); if(g_opt_ctrl_index<0) g_opt_ctrl_index=0; }
@@ -311,7 +344,9 @@ static void ini_apply(const char* k, const char* v){
     else if(!strcmp(k,"cheats")){ extern int g_opt_cheats; g_opt_cheats=atoi(v)!=0; }   /* cheats.c, live */
     else if(!strcmp(k,"fov")){ extern int g_opt_fov; g_opt_fov=atoi(v); if(g_opt_fov<60) g_opt_fov=60; if(g_opt_fov>160) g_opt_fov=160; }   /* cheats.c FOV hook, live */
     else if(!strcmp(k,"anisotropy")){ g_opt_aniso=atoi(v); if(g_opt_aniso<0) g_opt_aniso=0; if(g_opt_aniso>16) g_opt_aniso=16; }
+    else if(!strncmp(k,"vk_",3)){ extern int snxvk_tuning_set(const char*,int); snxvk_tuning_set(k,atoi(v)); }   /* native Vulkan tunings (snxvk_glue.c) */
     else if(!strcmp(k,"dlss")){ extern int snxvk_dlss_mode; snxvk_dlss_mode=atoi(v); }   /* native Vulkan: snxvk dlss.c; OpenGL: dlss_gl.c + gpu_gl.c dlg_* */
+    else if(!strcmp(k,"fsr_frame_generation")){ extern int snxvk_fsr_fg; snxvk_fsr_fg=atoi(v); }   /* native Vulkan: snxvk fsr_fg.c */
     else if(!strcmp(k,"texture_threads")){ g_opt_tex_threads=atoi(v); if(g_opt_tex_threads<0) g_opt_tex_threads=0; if(g_opt_tex_threads>16) g_opt_tex_threads=16; }
     else if(!strcmp(k,"fast_forward")) g_opt_ff=atoi(v);
     else if(!strcmp(k,"fast_forward_speed")){ g_opt_ff_speed=atoi(v); if(g_opt_ff_speed<2) g_opt_ff_speed=2; if(g_opt_ff_speed>8) g_opt_ff_speed=8; }
@@ -352,16 +387,19 @@ static const IniOpt INI_GRAPHICS[]={
   {"hdr_peak","0","HDR output: brightest highlight in nits; 0 = what the display reports"},
   {"prebuild_shaders","1","1 = build every shader before the game draws with it: the shaders it ships in romfs/system/shd, and the ones\n;   it unpacks into GPU memory (Metroid Prime 4 at boot), compiled in the background and kept ready. 0 = at first use"},
   {"shadows","1","0 = disable shadow maps (more FPS)"},
+  {"vk_fast_writeback","1","native Vulkan: 1 = a shader's storage image lands in guest memory a block at a time where the game left\n;   that memory alone (the per-byte merge held the frame back); 0 = byte by byte, as ScarletNX does"},
+  {"vk_async_pipelines","0","native Vulkan: 1 = a draw whose shader isn't built yet is skipped while it builds, instead of the game\n;   waiting for it: no hitch where a new effect first appears, but it shows up a few frames late. 0 = wait"},
+  {"vk_memory_traps","1","native Vulkan: 1 = what the GPU's shaders write to game memory stays on the GPU until the CPU\n;   touches it (its pages are trapped), instead of being copied back every frame. 0 = copied back"},
+  {"vk_dynamic_offsets","1","native Vulkan: 1 = the busiest buffer bindings take their offsets when a draw binds them, so draws\n;   that only move within the same buffers reuse their descriptor sets instead of writing new ones. 0 = new sets"},
   {"renderer","opengl","opengl, or vulkan = the game still renders with OpenGL but Vulkan puts the frames on screen\n;   (falls back to OpenGL output if the GPU driver can't share images between the two; restart required),\n;   or vulkan_native = EXPERIMENTAL native Vulkan renderer from ScarletNX (GPL-3.0; falls back to OpenGL if it can't start)"},
-#ifndef SWR_RELEASE   /* the public release: no DLSS (GPL) and no frame generation in that build */
   {"dlss","0","1 = NVIDIA DLAA anti-aliasing (renderer=opengl or vulkan_native, RTX GPU, nvngx_dlss.dll in the game folder):\n;   DLSS at the internal resolution with the game's own motion vectors; the HUD is untouched. 0 = off"},
-#endif
+  {"fsr_frame_generation","0","1 = AMD FSR 3.1 frame generation (renderer=vulkan_native, Windows; amd_fidelityfx_loader_vk.dll and\n;   amd_fidelityfx_framegeneration_vk.dll in the game folder): one generated frame between each pair the game renders. 0 = off"},
   {NULL,NULL,NULL}};
 static const IniOpt INI_PERF[]={
   {"audio_surround_downmix","1","1 = mix all six audio channels into the stereo output, as the console does (0 = front left/right only: no center channel, so no dialogue)"},
   {"cheats","1","1 = run the cheat codes that are on (Atmosphere format, <game>_data/cheats/<build id>.txt; turn them\n;   on and off in the in-game menu, Cheats page)"},
   {"fov","100","Field of view in percent of the game's own (60-160, applies live). Needs a FOV hook for this game\n;   build (beyond/fov_hooks.txt)"},
-  {"fps_limit","1","1 = 60 FPS (the speed of a Switch), 0 = unlimited (the game runs faster). Values under 60 are treated as 60: the game advances one step per image, so 30 meant half speed. F4 changes it in game"},
+  {"fps_limit","1","1 = 60 FPS (the speed of a Switch), otherwise the cap (60 to 240), 0 = unlimited. The game keeps real-time speed at any frame rate when its code was built with logic_rate.py; older builds run faster above 60. Values under 60 are treated as 60. F4 changes it in game"},
   {"video_async_retire","0","1 = retire obsolete video pictures on a bounded worker (experimental; restart required)"},
   {"video_avx2","1","1 = AVX2 video color conversion when the CPU has it (same result as the plain conversion, faster; restart required)"},
   {"video_block_copy","1","1 = video pictures written to tiled memory 64 bytes at a time (same result, faster; restart required)"},
@@ -393,9 +431,11 @@ static const IniOpt INI_FG[]={
   {NULL,NULL,NULL}};
 static const IniOpt INI_INPUT[]={
   {"controller_map","","16 comma-separated button destinations (0..15, -1 disabled); empty = default. Keyboard and sticks unchanged."},
-  {"mouse_aim","1","1 = mouse free aim: hold the right mouse button (the game's L, free aim) and move the mouse to aim\n;   in any direction; left click shoots (Y), middle click arms missiles (R). The cursor hides over the game"},
-  {"mouse_sensitivity","100","mouse free aim: how far the mouse moves for a full turn of the aim, in percent (10-1000)"},
-  {"mouse_buttons","y,l,r,-,-","mouse buttons left, right, middle, back, forward as Switch buttons: a b x y l r zl zr plus\n;   minus lstick rstick, - for none. The one set to l aims with the mouse while held"},
+  {"mouse_look","1","1 = the mouse turns the camera (the right stick) while the game window has focus. The cursor is\n;   held in the window and hidden; F1 (the in-game menu) or switching to another window frees it"},
+  {"mouse_sensitivity","100","mouse look: how far the camera turns for the same mouse movement, in percent (10-1000). At 100%,\n;   one mouse count turns it 0.05 degrees in first person, with code built with mouse_aim.py"},
+  {"mouse_invert_y","0","1 = moving the mouse up looks down"},
+  {"mouse_deadzone","15","mouse look where the mouse moves the right stick (lock-on, morph ball, menus, code without\n;   mouse_aim.py): the smallest stick push any mouse movement makes, in percent (0-50). Raise it if slow\n;   mouse movement doesn't turn the camera, lower it if small movements turn it too far"},
+  {"mouse_buttons","a,zl,r,-,-","mouse buttons left, right, middle, back, forward as Switch buttons: a b x y l r zl zr plus\n;   minus lstick rstick, - for none"},
   {"button_icons","auto","the game's button pictures: auto = from the controller connected at start (Xbox and Steam Deck:\n;   Xbox icons, DualShock 4: PS4, DualSense: PS5, Switch or none: the originals), or switch, xbox, ps4, ps5.\n;   Needs the icon packs in Metroid Prime 4 Beyond_data\\mods (the Play screen downloads them: Controls > Button icons)"},
   {"controller_api","auto","auto = SDL2 when SDL2.dll is next to the game (Bluetooth/USB Switch Pro, DualShock 4,\n;   DualSense, 8BitDo, Xbox...), else XInput. sdl or xinput to force one"},
   {"controller_index","0","0 = first connected controller, 1.. = that controller (in connection order) is player 1"},
@@ -424,7 +464,7 @@ static const IniOpt INI_REC[]={
 static const IniOpt INI_DBG[]={
   {"log","1","Log detail: 1 = normal, 2 = everything (slow)"},
   {"diag","0","1 = automatic diagnostic dumps (F5 always works)"},
-  {"profile","0","1 = write profile.txt every 10 seconds (CPU profiler)"},
+  {"profile","0","1 = write profile.txt every 10 seconds (CPU profiler); with vulkan_native also the GPU's time per pass in the log"},
   {NULL,NULL,NULL}};
 #ifndef SWR_RELEASE
 static const IniSec INI_SECS[]={{"Display",INI_DISPLAY},{"Graphics",INI_GRAPHICS},{"Performance",INI_PERF},{"Frame generation",INI_FG},{"Input",INI_INPUT},{"Audio",INI_AUDIO},{"Launcher",INI_LAUNCHER},{"Recording",INI_REC},{"Debug",INI_DBG},{NULL,NULL}};
@@ -435,7 +475,7 @@ static char g_ini_path[1400]; static u64 g_ini_mtime;
 
 static u64 file_mtime(const char* p){ struct stat st; if(stat(p,&st)) return 0; return (u64)st.st_mtime; }
 
-static int ini_known(const char* k){ for(int s=0;INI_SECS[s].title;s++) for(const IniOpt* o=INI_SECS[s].o;o->key;o++) if(!strcmp(o->key,k)) return 1; return 0; }
+static int ini_known(const char* k){ if(kbm_action_find(k)>=0) return 1; for(int s=0;INI_SECS[s].title;s++) for(const IniOpt* o=INI_SECS[s].o;o->key;o++) if(!strcmp(o->key,k)) return 1; return 0; }
 
 void ini_write(void){
   if(!g_ini_path[0]) return;
@@ -449,7 +489,10 @@ void ini_write(void){
   fprintf(f,"; =====================================================================\n");
   for(int s=0;INI_SECS[s].title;s++){
     fprintf(f,"\n[%s]\n",INI_SECS[s].title);
-    for(const IniOpt* o=INI_SECS[s].o;o->key;o++) fprintf(f,"; %s\n%s=%s\n",o->help,o->key,ini_get(o->key,o->def)); }
+    for(const IniOpt* o=INI_SECS[s].o;o->key;o++) fprintf(f,"; %s\n%s=%s\n",o->help,o->key,ini_get(o->key,o->def));
+    if(INI_SECS[s].o==INI_INPUT){
+      fprintf(f,"%s",KBM_INI_HELP);
+      for(int i=0;i<kbm_action_count();i++){ char b[128]; kbm_binding_get(i,b,sizeof b); fprintf(f,"%s=%s\n",kbm_action_key(i),ini_get(kbm_action_key(i),b)); } } }
   int other=0; for(int i=0;i<g_ini_n;i++) if(!ini_known(g_ini_k[i])){ if(!other){ fprintf(f,"\n[Other]\n"); other=1; } fprintf(f,"%s=%s\n",g_ini_k[i],g_ini_v[i]); }
   fclose(f);
   remove(g_ini_path); if(rename(tmp,g_ini_path)) { remove(tmp); return; }
@@ -459,7 +502,12 @@ volatile int g_ini_dirty;
 
 void ini_set(const char* k, const char* v){ ini_store(k,v); g_ini_dirty=1; }
 
-void ini_open(const char* path){ strncpy(g_ini_path,path,sizeof g_ini_path-1); ini_load(path); ini_write(); }
+void ini_open(const char* path){ strncpy(g_ini_path,path,sizeof g_ini_path-1); ini_load(path);
+  /* first start with the rebindable keyboard (no key_* lines yet): the mouse moves from the old default (left ZR) to
+     the PrimeHack layout's left = A, as the keys do. Any other mouse_buttons value was chosen and stays */
+  if(!ini_get("key_a",NULL) && !strcmp(ini_get("mouse_buttons",""),"zr,zl,r,-,-")){
+    ini_store("mouse_buttons","a,zl,r,-,-"); ini_apply("mouse_buttons","a,zl,r,-,-"); LOG("settings: mouse_buttons moved to the new default a,zl,r,-,-\n"); }
+  ini_write(); }
 
 /* ini edited while running: reload and apply what we can live */
 void ini_poll(void){
@@ -519,8 +567,56 @@ void vi_convert_cpu(u64 a, u32 w, u32 h, u32 pitch, u32 layout, u32 bhl, u32 fmt
 volatile int g_pace_fps=1;
 static void pace_update(void){ g_pace_fps=g_opt_fps; }
 
+/* Game logic at any frame rate. The game steps its logic by flt_93C5400[mode] seconds (mode 0 = 1/60, mode 1 = 1/30,
+   F_8E49AAC) once per presented frame, so above 60 fps it ran faster than real time. Code built with logic_rate.py
+   exports swr_logic_k (sixtieths per step): every site that picks a value by the mode follows it (step, times,
+   smoothing exponents, frame counts). Each frame k follows the measured frame time: exactly the cap while frames
+   arrive on time (k = 1 at 60 fps, as on the Switch), the smoothed real time while they come late, and never more
+   than 1/30 s, the game's own slowest step. SWR_LOGIC_HZ=N fixes k at 60/N (60..240), SWR_LOGIC_HZ=0 turns it off.
+   An older code DLL only gets SWR_LOGIC_HZ=N, as 1/N in the step table (smoothing then runs N/60 times faster).
+   Build 8275FBE1EC5191C2 only. */
+static float* g_logic_k; static volatile u64* g_logic_unknown; static volatile u32* g_logic_unknown_n;
+static void logic_hz_apply(void){
+  static int state; /* 0 = first frame, 1 = off or fixed, 2 = following the frame time */
+  static u32 said, snapped; static u64 last, frames, t0; static double ema, ksum, debt;
+  if(g_logic_unknown_n) for(u32 n=*g_logic_unknown_n; said<n && said<32; said++)   /* sites with no 2:1 pair, once */
+    LOG("game logic rate: site %llX keeps its 60 fps value (not a 2:1 pair)\n",(unsigned long long)g_logic_unknown[said]);
+  if(state==1) return;
+  if(state==0){ state=1;
+    static const u8 bid[8]={0x82,0x75,0xFB,0xE1,0xEC,0x51,0x91,0xC2};
+    const SwrModInfo* m=NULL;
+    if(g_mod) for(u32 i=0;i<g_mod->nmods;i++) if(!strcmp(g_mod->mods[i].name,"main")) m=&g_mod->mods[i];
+    int ours= m && m->base==0x8006000ull && !memcmp(m->build_id,bid,8);
+    const char* s=getenv("SWR_LOGIC_HZ");
+    if(s && *s){ int hz=atoi(s);
+      if(hz==0){ LOG("game logic rate: off (SWR_LOGIC_HZ=0), one 1/60 s step per frame\n"); return; }
+      if(hz<60 || hz>240){ WARN("SWR_LOGIC_HZ=%s ignored (60..240, or 0 for off)\n",s); return; }
+      if(!ours){ WARN("SWR_LOGIC_HZ: not build 8275FBE1EC5191C2, ignored\n"); return; }
+      if(g_logic_k){ *g_logic_k=60.0f/(float)hz; LOG("game logic rate: fixed at %d steps a second (k=%g)\n",hz,*g_logic_k); return; }
+      float t[2]; memcpy(t,GP(0x93C5400ull),8);
+      if(t[0]!=1.0f/60.0f || t[1]!=1.0f/30.0f){ WARN("SWR_LOGIC_HZ: step table holds %g, %g, not 1/60, 1/30: ignored\n",t[0],t[1]); return; }
+      t[0]=1.0f/(float)hz; memcpy(GP(0x93C5400ull),t,4);
+      LOG("game logic rate: step 1/%d s; this code DLL has no swr_logic_k, so smoothing stays at 1/60\n",hz); return; }
+    if(!ours || !g_logic_k) return;   /* the step stays 1/60 s per frame */
+    LOG("game logic rate: follows the frame time\n"); state=2; last=t0=plat_ns(); return; }
+  /* the cap: fps_limit 1 = 60, N = N (60..240), 0 = none; recording keeps 60, smooth recording paces in guest time */
+  int pf=g_pace_fps; double per= pf>=60 && pf<=240? 1.0/pf : (pf==0 && !g_rec_active)? 0 : 1.0/60;
+  u64 now=plat_ns(); double dt=(now-last)*1e-9; last=now;
+  if(dt>1.0/30) dt=1.0/30;   /* a hitch: the game slows down, as it does under 30 fps on the Switch */
+  ema= ema>0? ema+(dt-ema)*0.25 : dt;
+  int on_cap= per>0 && (g_vt_on || (ema>per*0.97 && ema<per*1.03)); double step= on_cap? per : ema; snapped+=on_cap;
+  /* debt = real time the steps have not covered yet. The average lags the pacer's catch-up frames after a slow one,
+     so past 2 ms a tenth of the debt is paid back each frame; inside 2 ms the step stays exact (k = 1 at 60 fps) */
+  if(!g_vt_on){ debt+=dt; if(debt>0.002 || debt<-0.002) step+=debt*0.1; if(step<0.5*ema) step=0.5*ema; }
+  float k=(float)(step*60.0); if(k<0.1f) k=0.1f; if(k>2.0f) k=2.0f;
+  if(!g_vt_on){ debt-=k/60.0; if(debt>0.1 || debt<-0.1) debt=0; }   /* a k clamp or a long stall: start over */
+  *g_logic_k=k; ksum+=k;
+  if(++frames%600==0){ /* every 600 frames: frame rate, frames at the cap, game time against real time */
+    LOG("game logic rate: %.1f steps a second, %u of 600 at the cap, game time %.1f%% of real time\n",600.0*60.0/ksum,snapped,100.0*(ksum/60.0)/((now-t0)*1e-9));
+    ksum=0; snapped=0; t0=now; } }
+
 void vi_show_buffer(u32 nvmap_id, u32 offset, u32 w, u32 h, u32 pitch, u32 layout, u32 bhl, u32 fmt){
-  pace_update();
+  pace_update(); logic_hz_apply();
   static int trace_configured;static FILE*limiter_trace;static unsigned trace_rows;
   if(!trace_configured){trace_configured=1;const char*path=getenv("SWR_TRACE_LIMITER");if(path&&path[0]){limiter_trace=fopen(path,"w");if(limiter_trace)fprintf(limiter_trace,"frame,thread,enter_ns,enqueued_ns,limit_begin_ns,end_ns,requested_sleep_ms,actual_sleep_ms,deadline_ns\n");}}
   u64 trace_enter=limiter_trace?plat_ns():0,trace_enqueued=0,trace_begin=0,trace_sleep=0,trace_actual=0,trace_deadline=0;
@@ -607,6 +703,12 @@ static int load_code(void){
     if(g_code_tcc) LOG("code: %s_code.dll was compiled with TCC. It runs several times slower than with GCC: recompile with GCC (SwitchRecomp, compiler GCC) for much better performance\n",g_exename);
     else LOG("code: %s_code.dll compiled with GCC (linker %u.%u)\n",g_exename,mj,mn); }
 #endif
+  g_logic_k=(float*)plat_dl_sym(h,"swr_logic_k");   /* logic_rate.py builds only */
+  g_logic_unknown=(volatile u64*)plat_dl_sym(h,"swr_logic_unknown"); g_logic_unknown_n=(volatile u32*)plat_dl_sym(h,"swr_logic_unknown_n");
+  { KbmAim a={(volatile int*)plat_dl_sym(h,"swr_aim_pend"),(volatile float*)plat_dl_sym(h,"swr_aim_deg"),
+      (volatile u32*)plat_dl_sym(h,"swr_aim_steps"),(volatile float*)plat_dl_sym(h,"swr_aim_mult")};
+    kbm_aim_bind(&a);   /* mouse_aim.py builds only */
+    LOG("code: mouse aim %s\n",a.pend? "built in (the mouse turns the camera directly in first person)" : "not built in (the mouse moves the right stick)"); }
   g_mod=f(); return 0; }
 
 static void build_dispatch(void){

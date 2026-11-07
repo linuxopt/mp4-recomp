@@ -34,7 +34,8 @@ static NamePool tex_names,buffer_names,fbo_names,vao_names,sampler_names;
 static u64 name_allocations,name_batches,name_wait_ns;
 static void name_pool_get(NamePool*pool,NameGenerator gen,GLsizei n,GLuint*out){
   if(n<=0){gen(n,out);return;}
-  if(getenv("SWR_NO_NAME_POOL")){u64 start=plat_ns();gen(n,out);name_wait_ns+=plat_ns()-start;name_batches++;name_allocations+=(u32)n;return;}
+  static int nopool=-1; if(nopool<0) nopool=getenv("SWR_NO_NAME_POOL")!=NULL;
+  if(nopool){u64 start=plat_ns();gen(n,out);name_wait_ns+=plat_ns()-start;name_batches++;name_allocations+=(u32)n;return;}
   for(GLsizei i=0;i<n;i++){if(!pool->left){u64 start=plat_ns();gen(1024,pool->ids);name_wait_ns+=plat_ns()-start;name_batches++;pool->left=1024;}out[i]=pool->ids[--pool->left];name_allocations++;}
 }
 static void pooled_textures(GLsizei n,GLuint*out){name_pool_get(&tex_names,p_glGenTextures,n,out);}
@@ -101,9 +102,6 @@ static GLuint link2(GLuint a, GLuint b, GLuint c3){
 extern int snxvk_dlss_mode;
 static char* dlg_vs_xfb(char* src){
   static const char* decl="out gl_PerVertex { invariant vec4 gl_Position;";
-#ifdef SWR_RELEASE
-  return src;
-#endif
   if(snxvk_dlss_mode<=0 || !src) return src;
   char* d=strstr(src,decl); char* nl=strchr(src,'\n'); if(!d || !nl || nl>d) return src;
   static const char* ext="#extension GL_ARB_enhanced_layouts : require\n";
@@ -299,7 +297,8 @@ static UploadScratch upload_linear,upload_source,upload_decoded;
 static u64 upload_allocations;
 static u8* upload_buffer(UploadScratch*b,u64 n){
   if(!n)n=1;
-  if(n>16ull*1024*1024 || getenv("SWR_NO_UPLOAD_SCRATCH")){upload_allocations++;return malloc((size_t)n);}
+  static int noscr=-1; if(noscr<0) noscr=getenv("SWR_NO_UPLOAD_SCRATCH")!=NULL;
+  if(n>16ull*1024*1024 || noscr){upload_allocations++;return malloc((size_t)n);}
   if(n>b->capacity){u8*p=realloc(b->data,(size_t)n);upload_allocations++;if(!p)return NULL;b->data=p;b->capacity=n;}
   return b->data;
 }
@@ -619,7 +618,8 @@ static Tex* tex_find_rt(u64 gva){ Tex* b=NULL; for(Tex* t=texh[hkey(gva)];t;t=t-
 static PFNGLCOPYIMAGESUBDATAPROC p_cis; static u64 st_rt_crop;
 
 static Tex* rt_crop(Tex* rt, u32 w, u32 h){
-  if(!p_cis || getenv("SWR_NO_RTCROP")) return rt;
+  static int nocrop=-1; if(nocrop<0) nocrop=getenv("SWR_NO_RTCROP")!=NULL;
+  if(!p_cis || nocrop) return rt;
   Tex* c=rt->crop;
   if(c && (c->w!=w || c->h!=h)){ glDeleteTextures(1,&c->id); if(c->view) glDeleteTextures(1,&c->view); free(c); c=rt->crop=NULL; }
   if(!c){ g_tmap_gen++; c=calloc(1,sizeof *c); c->gva=rt->gva; c->w=w; c->h=h; c->d=1; c->levels=1; c->target=GL_TEXTURE_2D; c->f=rt->f; c->fkey=rt->fkey; c->is_rt=1; c->bl=rt->bl; c->bh=rt->bh;
@@ -711,6 +711,8 @@ static Tex* vol_from_slices(Tex* rt0, u64 gva, u32 w, u32 h, u32 d, GlFmt f, u32
   c->last_used=g_frame; return c; }
 
 static int getenv_cached_nomip(void){ static int v=-1; if(v<0) v=getenv("SWR_NO_RT_MIPS")!=NULL; return v; }
+static int getenv_cached_coherence(void){ static int v=-1; if(v<0) v=getenv("SWR_TEXTURE_COHERENCE_TEST")!=NULL; return v; }
+static int getenv_cached_depthregs(void){ static int v=-1; if(v<0) v=getenv("SWR_DEPTH_REGS")!=NULL; return v; }
 
 /* the render target holding face/layer y of a level: its own RT, or layer y of the level's RT drawn with all layers
    at once (its vol, current when it was the last thing written there). Metroid Prime 4 blends two reflection probes
@@ -743,7 +745,8 @@ static Tex* layered_from_rts(Tex* rt0, u64 gva, u32 w, u32 h, u32 d, u32 levels,
       u32 gobpx= rt0->f.bpp? 64u/rt0->f.bpp : 16u; if(!gobpx) gobpx=1;
       if(r && r->target==GL_TEXTURE_2D && (r->w==lw || (l>0 && r->w>=lw && (r->w<lw*2 || r->w<=gobpx))) && (r->h==lh || (l>0 && r->h>=lh && r->h<lh*2)) && r->f.ifmt==rt0->f.ifmt){ sig=(sig^(r->wgen+y*31+l*977+(ly>=0? 0x5000u : 0u)))*16777619u; sig=(sig^(u32)(uintptr_t)r)*16777619u; if(ly>=0) anyvol=1; } else all=0; }
     if(!all) break; maxl=(int)l; }
-  if(getenv("SWR_LAYDBG")){ static int n; if(n<3){ n++; LOG("laydbg gva=%llx lsz=%llx bh=%u levels=%u maxl=%d\n",(unsigned long long)gva,(unsigned long long)lsz,bh,levels,maxl);
+  static int laydbg=-1; if(laydbg<0) laydbg=getenv("SWR_LAYDBG")!=NULL;
+  if(laydbg){ static int n; if(n<3){ n++; LOG("laydbg gva=%llx lsz=%llx bh=%u levels=%u maxl=%d\n",(unsigned long long)gva,(unsigned long long)lsz,bh,levels,maxl);
       for(u32 l=0;l<levels;l++) for(u32 y=0;y<d;y++){ u64 a=gva+(u64)y*lsz+loff[l]; Tex* r=tex_find_rt(a); LOG("  l%u c%u %llx -> %s %ux%u\n",l,y,(unsigned long long)a,r?"rt":"-",r?r->w:0,r?r->h:0); }
       for(int k=0;k<TEXH;k++) for(Tex* r=texh[k];r;r=r->next) if(r->is_rt && r->w<=64 && r->h<=64) LOG("  RT %llx %ux%u\n",(unsigned long long)r->gva,r->w,r->h); } }
   if(maxl<0) return NULL;   /* missing faces -> normal path */
@@ -1004,7 +1007,8 @@ static Tex* tex_from_tic_(u32* tic){
   if(rt && !f.compressed && !f.astc && rt->w>=w && rt->h>=h){ rt->last_used=g_frame; if(rt->w==w && rt->h==h) return rt; u64 z0=plat_ns(); Tex* cr=rt_crop(rt,w,h); st_tb_crop+=plat_ns()-z0; return cr; }   /* smaller view -> just that region */
   GLenum target=tex_target(type,d);
   if(target==GL_TEXTURE_CUBE_MAP && d!=6) target=GL_TEXTURE_2D_ARRAY;
-  if(f.astc && levels>1 && (g_has_astc || getenv("SWR_ASTC_SYNC"))) levels=1;   /* the CPU path keeps the mips (background decode) */
+  static int astc_sync=-1; if(astc_sync<0) astc_sync=getenv("SWR_ASTC_SYNC")!=NULL;
+  if(f.astc && levels>1 && (g_has_astc || astc_sync)) levels=1;   /* the CPU path keeps the mips (background decode) */
   for(Tex* t=texh[hkey(gva)];t;t=t->next){
     if(t->gva==gva && t->w==w && t->h==h && t->d==d && t->fkey==fkey && t->target==target && !t->is_rt){
       t->last_used=g_frame;
@@ -1012,7 +1016,7 @@ static Tex* tex_from_tic_(u32* tic){
       u64 vg=video_surface_generation(gmem_ptr(gva,1),t->size);
       if(vg){ if(vg!=t->video_gen){ tex_upload(t); t->video_gen=vg; t->frame_checked=g_frame; t->stable=0; } return t; }
       /* Diagnostic mode for gameplay: check CPU textures every frame without polling backoff. */
-      if(getenv("SWR_TEXTURE_COHERENCE_TEST")){ if(t->frame_checked!=g_frame){ t->frame_checked=g_frame; u64 hh=mem_hash(gva,t->size); if(hh!=t->hash){ t->hash=hh; tex_upload(t); } } return t; }
+      if(getenv_cached_coherence()){ if(t->frame_checked!=g_frame){ t->frame_checked=g_frame; u64 hh=mem_hash(gva,t->size); if(hh!=t->hash){ t->hash=hh; tex_upload(t); } } return t; }
       if(t->slh){ if(t->frame_checked!=g_frame){ t->frame_checked=g_frame; slab_poll(t, tex_dma_dirty(&t->dgen,gva,t->size)? t->nsl : (t->nsl+15)/16); } return t; }
       if(t->frame_checked!=g_frame && tex_dma_dirty(&t->dgen,gva,t->size)){
         t->frame_checked=g_frame; u64 hq=plat_ns(); u64 hh=mem_hash(gva,t->size); st_tchk_ns+=plat_ns()-hq;
@@ -1120,7 +1124,9 @@ static void translated_load(void){
     if(hd[0]!=0x544c4753||hd[1]!=TR_VERSION||hd[2]!=sizeof(ShaderInfo)||hd[3]>(8u<<20)||hd[4]>128||fread(&key,8,1,f)!=1)break;
     Translated*t=calloc(1,sizeof*t);t->key=key;t->ndep=hd[4];t->src=malloc((size_t)hd[3]+1);
     if(fread(&t->si,sizeof t->si,1,f)!=1||fread(t->dep,sizeof(TransDep),t->ndep,f)!=t->ndep||fread(t->src,1,hd[3],f)!=hd[3]){free(t->src);free(t);break;}
-    t->src[hd[3]]=0;translated_put(t);
+    t->src[hd[3]]=0;
+    if(shader_glsl_stale(t->src)){free(t->src);free(t);continue;}   /* translated again by the current translator */
+    translated_put(t);
   }fclose(f);if(translated_count)LOG("shaders: %u translated stages loaded before starting the game\n",translated_count);
 }
 static u64 translated_key(u64 hash,int stage,u32 key2,const ShaderInfo*input){
@@ -1523,7 +1529,8 @@ static Tex* rt_texture(u64 gva, u32 w, u32 h, u32 fmt, u32 tile, int depth){
   Tex* rv=NULL;
   for(Tex* t=texh[hkey(gva)];t;t=t->next) if(t->gva==~0ull && t->alias==gva && t->is_rt && t->w==w && t->h==h && t->fkey==fkey && !rv) rv=t;
   for(Tex* t=texh[hkey(gva)];t;t=t->next) if(t->gva==gva && t->is_rt){ t->gva=~0ull; t->alias=gva; g_tmap_gen++; }
-  if(rv && !getenv("SWR_NO_RT_ALIAS")){ rv->gva=gva; rv->alias=0; rv->last_used=g_frame; rv->hash=rt_sig(gva); rv->frame_checked=g_frame; return rv; }
+  static int noalias=-1; if(noalias<0) noalias=getenv("SWR_NO_RT_ALIAS")!=NULL;
+  if(rv && !noalias){ rv->gva=gva; rv->alias=0; rv->last_used=g_frame; rv->hash=rt_sig(gva); rv->frame_checked=g_frame; return rv; }
   Tex* t=tex_create(gva,w,h,1,1,GL_TEXTURE_2D,f,fkey,!((tile>>12)&1),(tile>>4)&15,(tile>>8)&15,0,1);
   glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_LINEAR); glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_LINEAR);
   /* seed from memory in case the CPU wrote it */
@@ -1839,8 +1846,8 @@ static void state_dirty(void){ g_state_ok=0; g_gs_ok=0; }
 void gpu_gl_state_dirty(void){ state_dirty(); }   /* the in-game menu drew with its own GL state (beyond_ui/ov.cpp) */
 /* FPS counter (main.c fps_overlay_rects) onto the window's framebuffer, as scissored clears */
 void gpu_gl_fps_overlay(void){
-  extern int fps_overlay_rects(int,int,int(*)[5],int); int (*r)[5]; int buf[64][5]; r=buf; int w=1,h=1; backend_window_size(&w,&h);
-  int n=fps_overlay_rects(w,h,r,64); if(!n) return;
+  extern int fps_overlay_rects(int,int,int(*)[5],int); int (*r)[5]; int buf[96][5]; r=buf; int w=1,h=1; backend_window_size(&w,&h);
+  int n=fps_overlay_rects(w,h,r,96); if(!n) return;
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER,0); glEnable(GL_SCISSOR_TEST); glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
   for(int i=0;i<n;i++){ glScissor(r[i][0],h-r[i][1]-r[i][3],r[i][2],r[i][3]);
     if(r[i][4]) glClearColor(1.0f,0.92f,0.2f,1.0f); else glClearColor(0.0f,0.0f,0.0f,1.0f);
@@ -1877,7 +1884,7 @@ static void apply_state(GpuChannel* ch){
     float n, f; memcpy(&n,&r[0x302],4); memcpy(&f,&r[0x303],4);
     /* depth goes through the viewport transform (z*scale_z+translate_z) like on hw / yuzu's vk backend.
        SMO's fog pass draws at z=1 with NOTEQUAL to skip the sky, so this has to be exact */
-    if((vt[2]!=0.0f || vt[5]!=0.0f) && !getenv("SWR_DEPTH_REGS")){ float red= (r[0x35F]&1)? 0.0f : 1.0f; n=vt[5]-vt[2]*red; f=vt[5]+vt[2];
+    if((vt[2]!=0.0f || vt[5]!=0.0f) && !getenv_cached_depthregs()){ float red= (r[0x35F]&1)? 0.0f : 1.0f; n=vt[5]-vt[2]*red; f=vt[5]+vt[2];
       if(fabsf_(n)<1e-6f) n=0.0f; if(fabsf_(n-1.0f)<1e-6f) n=1.0f; if(fabsf_(f)<1e-6f) f=0.0f; if(fabsf_(f-1.0f)<1e-6f) f=1.0f; }
     glDepthRangeIndexed(0,n,f); g_dl_dr[0]=n; g_dl_dr[1]=f;
     if(r[0x380]&1){ u32 xs=r[0x381], ys=r[0x382]; glEnable(GL_SCISSOR_TEST); glScissorIndexed(0,(GLint)((xs&0xFFFF)*g_scale),(GLint)((ys&0xFFFF)*g_scale),(GLsizei)(((xs>>16)-(xs&0xFFFF))*g_scale+0.5f),(GLsizei)(((ys>>16)-(ys&0xFFFF))*g_scale+0.5f)); }
@@ -2303,11 +2310,7 @@ static struct {
   u64 stable, stable_z, chosen, chosen_z; int streak, missing, done, reset, evals, evaluated;
   Tex *need, *need_z;    /* DLSS runs before the draw that first reads the scene target */
 } g_dlg;
-#ifdef SWR_RELEASE   /* the public release has no DLSS (NVIDIA's licence question is open): off whatever the .ini says */
-static int dlg_on(void){ return 0; }
-#else
 static int dlg_on(void){ return snxvk_dlss_mode>0 && !g_gles && !dlgl_failed(); }
-#endif
 static int dlg_full_hdr(const Tex* t){ return t && t->f.ifmt==GL_R11F_G11F_B10F && g_dlg.scene_w && t->w==g_dlg.scene_w && t->h==g_dlg.scene_h; }
 static int dlg_written(u64 a){ for(int i=0;i<g_dlg.nwritten;i++) if(g_dlg.written[i]==a) return 1; return 0; }
 static Tex* dlg_find(u64 gva, int depth){ for(Tex* t=texh[hkey(gva)];t;t=t->next) if(t->gva==gva && t->is_rt && !!t->f.depth==depth) return t; return NULL; }
@@ -2913,7 +2916,7 @@ void r3d_draw_gl(GpuChannel* ch, int indexed, u32 topology, u32 first, u32 count
   /* view volume clip control (0x64F): bits 3/4 clamp depth at the near/far planes instead of clipping. Prime 4 sets
      both on every draw (0x101a); without the clamp, geometry right at a plane (its shadow-tile reset triangles, the
      first-person cannon close to the near plane) was cut away */
-  { static int cl=-1; int want= (r[0x64F]&0x18)!=0 && !getenv("SWR_NO_DEPTH_CLAMP"); if(want!=cl){ if(want) glEnable(0x864F /* GL_DEPTH_CLAMP */); else glDisable(0x864F); cl=want; } }
+  { static int cl=-1, noclamp=-1; if(noclamp<0) noclamp=getenv("SWR_NO_DEPTH_CLAMP")!=NULL; int want= (r[0x64F]&0x18)!=0 && !noclamp; if(want!=cl){ if(want) glEnable(0x864F /* GL_DEPTH_CLAMP */); else glDisable(0x864F); cl=want; } }
   { static u64 dh=1; static int nd; if(dh==1){ const char* e=getenv("SWR_DBG_CBDUMP"); dh= e? strtoull(e,NULL,16) : 0; }   /* debugging: one draw's constant buffers (+ an RT) to captures/cbdump */
     static int armed; if(dh && fs->hash==dh && !armed){ FILE* g=fopen("captures/cbdump/go","rb"); if(g){ fclose(g); remove("captures/cbdump/go"); armed=1; nd=0; } }   /* armed by creating the file */
     if(dh && fs->hash==dh && armed && nd<3){ nd++; if(nd==3) armed=0; plat_mkdir("captures"); plat_mkdir("captures/cbdump");
@@ -3655,7 +3658,8 @@ static void warm_load(void){
   for(;;){ u32 mg,a,b; u64 key; if(fread(&mg,4,1,f)!=1 || (mg!=0x4B435053 && mg!=0x33504853) || fread(&key,8,1,f)!=1) break;
     if(mg==0x33504853){ u32 st=0; if(fread(&st,4,1,f)!=1 || fread(&a,4,1,f)!=1 || a>(8u<<20)) break;
       char* src=malloc(a+1); if(fread(src,1,a,f)!=a){ free(src); break; } src[a]=0;
-      if(pk_has(key)){free(src);continue;}pk_put(key);
+      /* a stale translation (shader.h) is not queued and its key stays free, so the pack takes the new one */
+      if(pk_has(key) || shader_glsl_stale(src)){free(src);continue;}pk_put(key);
       if(g_worker!=1){
         if(g_pcache>0 && (st!=ST_VS || strstr(src,"gl_Position = vec4(0.0, 0.0, 0.0, 1.0)"))){
           char path[160];snprintf(path,sizeof path,"shader_cache/%s_s%016llx.bin",g_pc_tag,(unsigned long long)key);
@@ -3668,7 +3672,7 @@ static void warm_load(void){
     if(fread(&a,4,1,f)!=1 || a>(8u<<20)) break;
     char* vs=malloc(a+1); if(fread(vs,1,a,f)!=a){ free(vs); break; } vs[a]=0;
     if(fread(&b,4,1,f)!=1 || b>(8u<<20)){ free(vs); break; } char* fs=malloc(b+1); if(fread(fs,1,b,f)!=b){ free(vs); free(fs); break; } fs[b]=0;
-    if(pk_has(key)){ free(vs); free(fs); continue; } pk_put(key);
+    if(pk_has(key) || shader_glsl_stale(vs) || shader_glsl_stale(fs)){ free(vs); free(fs); continue; } pk_put(key);
     char path[160]; snprintf(path,sizeof path,"shader_cache/%s_%016llx.bin",g_pc_tag,(unsigned long long)key);
     FILE* t= g_pcache? fopen(path,"rb") : NULL; if(t){ fclose(t); free(vs); free(fs); continue; }   /* already have a binary for this PC */
     if(wq_n>=cap){ cap= cap? cap*2 : 256; wq=realloc(wq,cap*sizeof *wq); } wq[wq_n].key=key; wq[wq_n].vs=vs; wq[wq_n].fs=fs; wq[wq_n].sep=0; wq[wq_n].stage=0; wq_n++; }
@@ -3765,6 +3769,9 @@ static void prebuild_shaders(void){
       else { trans_ndep=0; trans_overflow=0; g_shader_cb_read=pb_no_cb; src=shader_to_glsl(buf+o,avail,stage,&si); g_shader_cb_read=sh_cb_read;
         if(!src || si.unsupported){ free(src); failed++; continue; }
         src=sh_post(src,stage); if(stage==ST_FS) src=sh_nan_guard(src); translated_save(tk,&si,src); }   /* translated_save skips one that needed constant buffers */
+      /* a BRX table needs the constant buffers, which a pre-build has not: every instruction would be a case, NVIDIA compiles
+         that for minutes to fail, and the draw translates it again with the table anyway (another program) */
+      if(strstr(src,SH_ALL_CASES)){ free(src); continue; }
       if(stage==ST_VS) src=dlg_vs_xfb(src);
       Sh* s=calloc(1,sizeof *s); s->stage=stage; s->hash=h; s->src=src; u64 key=sh_key(s);
       char bp[200]; snprintf(bp,sizeof bp,"shader_cache/%s_s%016llx.bin",g_pc_tag,(unsigned long long)key);
@@ -3929,6 +3936,7 @@ static void mem_prebuild_step(void){
         if(getenv("SWR_TRACE_PREBUILD") || g_mp_failed%50==49){ char l[400]; int o=0; for(int q=0;q<16 && why[q][0];q++) o+=snprintf(l+o,sizeof l-o," %s:%u",why[q],nwhy[q]); LOG("shaders: pre-build: not translated, by first missing instruction:%s\n",l); }
         free(src); g_mp_failed++; break; }
       src=sh_post(src,stage); if(stage==ST_FS) src=sh_nan_guard(src); translated_save(tk,&si,src); }
+    if(strstr(src,SH_ALL_CASES)){ free(src); break; }   /* a BRX table needs constant buffers: built at the draw (see the pre-build above) */
     if(!v && stage==ST_FS && !getenv("SWR_NO_PREBUILD_INTTEX")){ int nt=si.ntex<32? si.ntex : 32;
       for(int i=0;i<nt;i++){ ShTex* st=&si.tex[i]; if(st->type==1 && st->fetch_only && !st->shadow) vtm|=1u<<i; }
       if(vtm){ nv=2; free(src); g_mp_found--; continue; } }

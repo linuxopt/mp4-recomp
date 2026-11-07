@@ -34,7 +34,7 @@ u64 gmmu_run(u64 gva, u64 max, u64* cpu){
     if(!e || (e&~0xFFFull)!=want) break; n+=0x1000; want+=0x1000; }
   return n<max? n : max; }
 
-extern int g_snxvk_on; extern void snxvk_map_begin(u64,u64), snxvk_map_end(u64,u64), snxvk_kick(void);
+extern int g_snxvk_on; extern void snxvk_map_begin(u64,u64), snxvk_map_end(u64,u64), snxvk_kick(void), snxvk_own_acquire(u64,u64);
 extern void snxvk_submit(const void*,u32,u32,u32,u32,u32,u32);
 /* The mapped runs {gva, cpu, size} as an index from the guest side, for the native Vulkan renderer (ScarletNX's
    gmmu_aliases): the same guest memory can be mapped at several GPU addresses, and a write known by its guest address
@@ -42,21 +42,36 @@ extern void snxvk_submit(const void*,u32,u32,u32,u32,u32,u32);
    guest memory under a mapping still counts here */
 typedef struct { u64 gva, cpu, size; } GRun;
 static GRun* g_runs; static u32 g_nruns, g_capruns; static PMutex g_runs_lk;
+/* gmmu_aliases' index: the runs by guest address, with the furthest end of each and the ones before it, so a query
+   finds its first candidate by binary search instead of walking every mapping (the native Vulkan GPU thread's top
+   function on Metroid Prime 4, thousands of runs a call). Rebuilt on the first query after a map or unmap */
+static GRun* g_by_cpu; static u64* g_max_end; static u32 g_nby, g_capby; static int g_by_stale=1;
+static int run_cpu_cmp(const void* a, const void* b){ u64 x=((const GRun*)a)->cpu, y=((const GRun*)b)->cpu; return x<y? -1 : x>y; }
+static void runs_index(void){
+  if(g_nruns>g_capby){ g_capby=g_capruns; g_by_cpu=realloc(g_by_cpu,g_capby*sizeof *g_by_cpu); g_max_end=realloc(g_max_end,g_capby*sizeof *g_max_end); }
+  memcpy(g_by_cpu,g_runs,g_nruns*sizeof *g_runs); g_nby=g_nruns;
+  qsort(g_by_cpu,g_nby,sizeof *g_by_cpu,run_cpu_cmp);
+  u64 m=0; for(u32 i=0;i<g_nby;i++){ u64 e=g_by_cpu[i].cpu+g_by_cpu[i].size; if(e>m) m=e; g_max_end[i]=m; }
+  g_by_stale=0; }
 static void runs_cut(u64 gva, u64 size){   /* drop [gva, gva+size) from the runs, splitting the ones it cuts through */
-  u64 e=gva+size;
+  u64 e=gva+size; g_by_stale=1;
   for(u32 i=0;i<g_nruns;){ GRun r=g_runs[i]; u64 re=r.gva+r.size;
     if(re<=gva || r.gva>=e){ i++; continue; }
     g_runs[i]=g_runs[--g_nruns];   /* remove, then add back what lies outside the cut */
     if(r.gva<gva){ GRun a={r.gva,r.cpu,gva-r.gva}; if(g_nruns==g_capruns){ g_capruns=g_capruns? g_capruns*2 : 256; g_runs=realloc(g_runs,g_capruns*sizeof *g_runs); } g_runs[g_nruns++]=a; }
     if(re>e){ GRun b={e,r.cpu+(e-r.gva),re-e}; if(g_nruns==g_capruns){ g_capruns=g_capruns? g_capruns*2 : 256; g_runs=realloc(g_runs,g_capruns*sizeof *g_runs); } g_runs[g_nruns++]=b; } } }
 static void runs_add(u64 gva, u64 cpu, u64 size){
+  g_by_stale=1;
   if(g_nruns==g_capruns){ g_capruns=g_capruns? g_capruns*2 : 256; g_runs=realloc(g_runs,g_capruns*sizeof *g_runs); }
   g_runs[g_nruns++]=(GRun){gva,cpu,size}; }
 void gmmu_aliases(u64 cpu, u64 size, void (*fn)(void* ctx, u64 gva, u64 n), void* ctx){
   u64 e=cpu+size; if(!size) return;
   pm_lock(&g_runs_lk);
-  for(u32 i=0;i<g_nruns;i++){ const GRun* r=&g_runs[i]; u64 lo= r->cpu>cpu? r->cpu : cpu, hi= r->cpu+r->size<e? r->cpu+r->size : e;
-    if(lo<hi) fn(ctx,r->gva+(lo-r->cpu),hi-lo); }
+  if(g_by_stale) runs_index();
+  /* the first run that can reach cpu: g_max_end rises, so the first index whose furthest end is past cpu */
+  u32 lo=0, hi=g_nby; while(lo<hi){ u32 m=(lo+hi)/2; if(g_max_end[m]<=cpu) lo=m+1; else hi=m; }
+  for(u32 i=lo;i<g_nby && g_by_cpu[i].cpu<e;i++){ const GRun* r=&g_by_cpu[i]; u64 a= r->cpu>cpu? r->cpu : cpu, b= r->cpu+r->size<e? r->cpu+r->size : e;
+    if(a<b) fn(ctx,r->gva+(a-r->cpu),b-a); }
   pm_unlock(&g_runs_lk); }
 /* each run of the page table over [gva, gva+size), in GPU order: fn(ctx, gva, cpu, n), unmapped pages skipped */
 void gmmu_pieces(u64 gva, u64 size, void (*fn)(void* ctx, u64 gva, u64 cpu, u64 n), void* ctx){
@@ -94,7 +109,9 @@ static u32 syncpt[256]; static u32 syncpt_max[256]; static PCond g_sync_cv; stat
 
 u32 syncpt_read(u32 id){ return __atomic_load_n(&syncpt[id&255],__ATOMIC_SEQ_CST); }
 
-void syncpt_incr(u32 id){ pm_lock(&g_sync_lk); syncpt[id&255]++; pc_broadcast(&g_sync_cv); pm_unlock(&g_sync_lk); snxvk_kick();
+/* the value raised by n, its waiters woken; the kernel events it reaches are the caller's (nv_events_check) */
+void syncpt_bump(u32 id, u32 n){ pm_lock(&g_sync_lk); syncpt[id&255]+=n; pc_broadcast(&g_sync_cv); pm_unlock(&g_sync_lk); }
+void syncpt_incr(u32 id){ syncpt_bump(id,1); snxvk_kick();
   extern void nv_events_check(void); nv_events_check(); }
 
 int syncpt_wait(u32 id, u32 thresh, i64 timeout){
@@ -308,7 +325,7 @@ static int nvdrv_disp(SvcObj* o, IpcCtx* c){
         case DEV_AS: r=ioctl_as(cmd,tmp,(u32)(isz>nb?isz:nb),(c->cmd==12&&ea)? GP(ea):NULL,(u32)es); break;
         case DEV_CTRL: r=ioctl_ctrl(cmd,tmp,nb); break;
         case DEV_CTRLGPU: r=ioctl_ctrlgpu(cmd,tmp,nb,(c->cmd==12&&ea)? GP(ea):NULL,(u32)es); break;
-        case DEV_GPU: r=ioctl_gpu(f,cmd,tmp,(u32)(isz>nb?isz:nb),ea? GP(ea):NULL,(u32)es); break;
+        case DEV_GPU: if(ea) snxvk_own_acquire(ea,es); r=ioctl_gpu(f,cmd,tmp,(u32)(isz>nb?isz:nb),ea? GP(ea):NULL,(u32)es); break;
         case DEV_NVDEC: r=host1x_ioctl(0,(u32)fd,cmd,tmp,(u32)(isz>nb?isz:nb)); break;
         case DEV_VIC: r=host1x_ioctl(1,(u32)fd,cmd,tmp,(u32)(isz>nb?isz:nb)); break;
         default: WARN("nvdrv: ioctl %x to unknown device\n",cmd); break;

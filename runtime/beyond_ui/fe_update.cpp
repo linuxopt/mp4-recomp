@@ -73,9 +73,11 @@ static std::string manifest_url() { std::string b = base_url(); return b.empty()
 static std::string package_url(const Manifest& m) { std::string b = base_url(); return b.empty() ? std::string("https://github.com/") + REPO + "/releases/download/" + m.tag + "/" + m.pkg : b + "/" + m.pkg; }
 std::string update_notes_url() { ulock(); std::string t = g_latest.tag; uunlock(); return std::string("https://github.com/") + REPO + "/releases/tag/" + t; }
 
-// GET url into *body (small) or into the file `path` (large); progress into g_us.pct. Redirects (github.com -> its
-// download host) are followed by WinHTTP; https only, except http://127.0.0.1 for tests.
-static bool http_get(const std::string& url, std::string* body, const std::string& path, long long expect, std::string* err) {
+// GET url into *body (small) or into the file `path` (large); progress into g_us.pct, or into `progress` when one is given
+// (the DLSS download). Redirects (github.com -> its download host) are followed by WinHTTP; https only, except
+// http://127.0.0.1 for tests.
+static bool http_get(const std::string& url, std::string* body, const std::string& path, long long expect, std::string* err,
+                     std::function<void(float)> progress = nullptr) {
     std::wstring w = wide(url); URL_COMPONENTS uc = {sizeof uc}; wchar_t host[256], up[2048]; uc.lpszHostName = host; uc.dwHostNameLength = 256; uc.lpszUrlPath = up; uc.dwUrlPathLength = 2048;
     if (!WinHttpCrackUrl(w.c_str(), 0, 0, &uc)) { *err = "bad address " + url; return false; }
     bool https = uc.nScheme == INTERNET_SCHEME_HTTPS;
@@ -89,7 +91,7 @@ static bool http_get(const std::string& url, std::string* body, const std::strin
     bool ok = r && WinHttpSendRequest(r, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(r, nullptr);
     DWORD code = 0, cl = sizeof code;
     if (ok) WinHttpQueryHeaders(r, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &code, &cl, WINHTTP_NO_HEADER_INDEX);
-    if (!ok) *err = "could not reach the update server (error " + std::to_string(GetLastError()) + ")";
+    if (!ok) *err = "could not reach the server (error " + std::to_string(GetLastError()) + ")";
     else if (code != 200) { *err = code == 404 ? "no update information on the server yet" : "the update server answered " + std::to_string(code); ok = false; }
     FILE* f = nullptr;
     if (ok && body == nullptr) { f = _wfopen(wide(path).c_str(), L"wb"); if (!f) { *err = "cannot write " + path; ok = false; } }
@@ -100,7 +102,7 @@ static bool http_get(const std::string& url, std::string* body, const std::strin
         std::vector<char> b(avail); DWORD n = 0; if (!WinHttpReadData(r, b.data(), avail, &n)) { *err = "download interrupted"; ok = false; break; }
         if (body) { body->append(b.data(), n); if (body->size() > (1u << 20)) { *err = "update information too large"; ok = false; } }
         else if (fwrite(b.data(), 1, n, f) != n) { *err = "disk full?"; ok = false; }
-        got += n; if (expect > 0) { ulock(); g_us.pct = (float)(100.0 * got / expect); uunlock(); }
+        got += n; if (expect > 0) { float v = (float)(100.0 * got / expect); if (progress) progress(v); else { ulock(); g_us.pct = v; uunlock(); } }
     }
     if (f) fclose(f);
     if (r) WinHttpCloseHandle(r); if (c) WinHttpCloseHandle(c); WinHttpCloseHandle(s);
@@ -209,6 +211,68 @@ void update_install_async() {
     ulock(); bool ok = g_us.stage == UP_AVAILABLE; uunlock(); if (!ok) return;
     CloseHandle(CreateThread(nullptr, 0, install_thread, nullptr, 0, nullptr));
 }
+
+// ---------------------------------------------------------------- pinned model downloads (Graphics page)
+// Files that are not in the release: each comes from its vendor's GitHub at a pinned tag, into the game folder under a
+// temporary name. A package (one or more files) is renamed into place only when every file matches its size and
+// SHA-256; a failure deletes all of the package's temporary files. They are not in update.txt, so the updater never
+// touches them.
+struct PinnedFile { const char* name; const char* url; long long size; const char* sha; };
+struct PinnedPackage {
+    const char* owner;                              // the messages say "<owner> GitHub"
+    std::vector<PinnedFile> files;
+    SRWLOCK lock = SRWLOCK_INIT; PinnedDownloadState state;   // state is read and written under lock
+};
+static void plock(PinnedPackage& p) { AcquireSRWLockExclusive(&p.lock); }
+static void punlock(PinnedPackage& p) { ReleaseSRWLockExclusive(&p.lock); }
+// NVIDIA DLSS: nvngx_dlss.dll, NVIDIA's own file for RTX cards
+static PinnedPackage g_dlss = {"NVIDIA's", {
+    {"nvngx_dlss.dll", "https://raw.githubusercontent.com/NVIDIA/DLSS/v310.9.16/lib/Windows_x86_64/rel/nvngx_dlss.dll", 58956912,
+     "d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e"}}};
+// AMD frame generation (native Vulkan): the two Authenticode-signed DLLs of FidelityFX SDK 2.4.0, both needed
+static PinnedPackage g_fsr = {"AMD's FidelityFX", {
+    {"amd_fidelityfx_loader_vk.dll", "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v2.4.0/Kits/FidelityFX/signedbin/amd_fidelityfx_loader_vk.dll", 39184,
+     "38a56a01fb3565c0757d9f5c1e4e69de4b65e5f2e5769b323b200dc1f142bab9"},
+    {"amd_fidelityfx_framegeneration_vk.dll", "https://raw.githubusercontent.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK/v2.4.0/Kits/FidelityFX/signedbin/amd_fidelityfx_framegeneration_vk.dll", 36806928,
+     "d002dabff8c5e71eaa715fc99438cd4dc81230262a7897b16bc402efec3498b4"}}};
+
+static void pinned_fail(PinnedPackage& p, const std::string& e) { plock(p); p.state.stage = PIN_ERROR; p.state.error = e; punlock(p); }
+static PinnedDownloadState pinned_state(PinnedPackage& p) { plock(p); PinnedDownloadState s = p.state; punlock(p); return s; }
+static void pinned_remove_parts(const PinnedPackage& p) { for (auto& f : p.files) DeleteFileW(wide(join(P.exedir, std::string(f.name) + ".part")).c_str()); }
+static DWORD WINAPI pinned_thread(void* arg) {
+    PinnedPackage& p = *(PinnedPackage*)arg;
+    long long total = 0, got = 0; std::string err;
+    for (auto& f : p.files) total += f.size;
+    pinned_remove_parts(p);
+    for (auto& f : p.files) {   // one file after another; the bar counts bytes over the whole package
+        std::string name = f.name, part = join(P.exedir, name + ".part");
+        auto progress = [&](float v) { plock(p); p.state.pct = (float)(100.0 * ((double)got + (double)f.size * v / 100.0) / (double)total); punlock(p); };
+        if (!http_get(f.url, nullptr, part, f.size, &err, progress)) {
+            pinned_remove_parts(p); pinned_fail(p, "could not download " + name + " from " + p.owner + " GitHub: " + err); return 0; }
+        if (file_size(part) != f.size || sha256_file(part) != f.sha) {
+            pinned_remove_parts(p); pinned_fail(p, "the download is not " + std::string(p.owner) + " " + name + " (size or checksum differs): nothing was kept"); return 0; }
+        got += f.size;
+    }
+    // every file checked: they go into place together, or none does
+    for (size_t i = 0; i < p.files.size(); i++) {
+        std::string name = p.files[i].name;
+        if (!MoveFileExW(wide(join(P.exedir, name + ".part")).c_str(), wide(join(P.exedir, name)).c_str(), MOVEFILE_REPLACE_EXISTING)) {
+            for (size_t j = 0; j < i; j++) DeleteFileW(wide(join(P.exedir, p.files[j].name)).c_str());
+            pinned_remove_parts(p); pinned_fail(p, "could not put " + name + " in the game folder (error " + std::to_string(GetLastError()) + ")"); return 0; }
+    }
+    plock(p); p.state.stage = PIN_DONE; p.state.pct = 100; punlock(p);
+    return 0;
+}
+static void pinned_start(PinnedPackage& p) {
+    plock(p); bool busy = p.state.stage == PIN_DOWNLOADING; if (!busy) { p.state = PinnedDownloadState(); p.state.stage = PIN_DOWNLOADING; } punlock(p);
+    if (busy) return;   // one download at a time: a second click does nothing
+    HANDLE t = CreateThread(nullptr, 0, pinned_thread, &p, 0, nullptr);
+    if (t) CloseHandle(t); else pinned_fail(p, "could not start the download");
+}
+PinnedDownloadState dlss_download_state() { return pinned_state(g_dlss); }
+void dlss_download_async() { pinned_start(g_dlss); }
+PinnedDownloadState fsr_download_state() { return pinned_state(g_fsr); }
+void fsr_download_async() { pinned_start(g_fsr); }
 
 // ---------------------------------------------------------------- undo (the newest update_backup folder back in place)
 // only the folders installs made (<version>-<date>); "undone-*" holds what an undo replaced and is never restored

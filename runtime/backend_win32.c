@@ -8,12 +8,13 @@
 #include <math.h>
 #include <ctype.h>
 #include "pad_remap.h"
+#include "input_kbm.h"
 #include <windows.h>
 #include <mmsystem.h>  /* timeBeginPeriod (windows.h leaves it out with WIN32_LEAN_AND_MEAN) */
 
 static HWND g_hwnd; static HDC g_hdc; static HGLRC g_ctx, g_wctx;
 static HWND g_glwnd; static int g_want_vk;   /* renderer=vulkan: GL renders on the hidden g_glwnd, Vulkan presents on g_hwnd */
-static volatile int g_ww=1280, g_wh=720; static u64 keys_held,keys_tapped;static int test_tap_sample; static int g_fullscreen=0, g_want_fs=1;
+static volatile int g_ww=1280, g_wh=720; static int g_fullscreen=0, g_want_fs=1;
 static WINDOWPLACEMENT g_wp={sizeof(WINDOWPLACEMENT)};
 static int g_seconds=0; static char g_shot[1024]; static u64 g_start; static volatile int g_shot_req;
 static char g_script[8192];
@@ -21,11 +22,12 @@ static HANDLE g_ready;
 static volatile int g_fe_mode;   /* the front end owns the window (its messages go to fe_wndproc) */
 static HANDLE g_fe_done, g_video_go; static int g_fe_result, g_win_started;
 static HWND g_fe_hwnd;
-/* mouse free aim: raw movement since the last poll (WM_INPUT, any thread adds, the input thread takes), and the buttons
-   held (1 left, 2 right, 4 middle, 8 back, 16 forward) */
-static volatile LONG g_mdx, g_mdy, g_mbtn;   /* the front end's window, retired at Play (its messages go to DefWindowProc) */
+/* mouse buttons held, window thread only: the mouse is captured while any is down, so releases outside still arrive */
+static int g_mouse_down;
+/* mouse look holds the cursor in the window: the input thread asks (WM_APP+12), the window thread clips */
+static int g_cursor_clipped;
 #define PAD_HOME (1ull<<30)   /* Home / Guide / PS: physical only, opens the in-game menu, never reaches the game */
-extern int g_opt_fps;
+extern int g_opt_fps, g_opt_ff;   /* main.c: fps_limit, fast_forward (Tab) */
 
 static int g_ls_mode=0; static char g_ls_path[1024];
 
@@ -147,19 +149,19 @@ static void set_fullscreen(int on){
     if(GetWindowPlacement(g_hwnd,&g_wp) && GetMonitorInfo(MonitorFromWindow(g_hwnd,MONITOR_DEFAULTTOPRIMARY),&mi)){
       SetWindowLong(g_hwnd,GWL_STYLE,st&~WS_OVERLAPPEDWINDOW);
       SetWindowPos(g_hwnd,HWND_TOP,mi.rcMonitor.left,mi.rcMonitor.top,mi.rcMonitor.right-mi.rcMonitor.left,mi.rcMonitor.bottom-mi.rcMonitor.top,SWP_NOOWNERZORDER|SWP_FRAMECHANGED); }
-    ShowCursor(FALSE); g_fullscreen=1;
+    g_fullscreen=1;   /* the cursor is hidden over the game by WM_SETCURSOR, so the menu can still show it */
   } else if(!on && g_fullscreen){
     SetWindowLong(g_hwnd,GWL_STYLE,st|WS_OVERLAPPEDWINDOW); SetWindowPlacement(g_hwnd,&g_wp);
     SetWindowPos(g_hwnd,NULL,0,0,0,0,SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_NOOWNERZORDER|SWP_FRAMECHANGED);
-    ShowCursor(TRUE); g_fullscreen=0; }
+    g_fullscreen=0; }
 }
 
 /* fullscreen on/off from any thread (in-game menu, settings): done on the window thread */
 /* the front end (same thread as the window) switches fullscreen with the game's own code, cursor kept visible */
-void backend_fe_fullscreen(int on){ if((on!=0)==(g_fullscreen!=0)) return; set_fullscreen(on); if(on) ShowCursor(TRUE); }
+void backend_fe_fullscreen(int on){ if((on!=0)==(g_fullscreen!=0)) return; set_fullscreen(on); }
 void backend_set_fullscreen(int on){ if(g_hwnd) PostMessageA(g_hwnd,WM_APP+11,(WPARAM)(on!=0),0); }
 int backend_is_fullscreen(void){ return g_fullscreen; }
-void backend_release_keys(void){ keys_held=0; keys_tapped=0; }
+void backend_release_keys(void){ kbm_release_all(); }
 void backend_request_quit(void){ if(g_hwnd) PostMessageA(g_hwnd,WM_CLOSE,0,0); }   /* the in-game menu's Quit */
 void* backend_hwnd(void){ return g_hwnd; }
 
@@ -204,24 +206,68 @@ void backend_rec_state(int on){ if(g_hwnd) PostMessageA(g_hwnd,WM_APP+8,(WPARAM)
 static const char* HELP=
   "Metroid Prime 4 Beyond - controls\n\n"
   "XInput (Xbox) controller: same as the Switch controller (A/B swapped by position).\n\n"
-  "Keyboard:\n"
-  "  Arrows = D-Pad     W A S D = Left stick    I J K L = Right stick\n"
-  "  X / Space = A    Z = B    C = X    V = Y\n"
-  "  Q = L   E = R   1 = ZL   3 = ZR   Enter = +   Backspace = -\n\n"
+  "Keyboard (PrimeHack-style; F1 > Controls or key_* in the .ini changes them):\n"
+  "  W A S D / arrows = move    Space = B (jump)    Ctrl = Y (morph)    Shift = ZL (lock on)\n"
+  "  E / Alt = X (visor)   F = R   Q = L   Enter = A   1 2 3 4 = D-pad weapons   R = +   Tab / ` = -\n\n"
+  "Mouse (mouse_look=1; the menu or another window frees the cursor):\n"
+  "  Move = camera   Left = A (fire)   Right = ZL   Middle = R   (mouse_buttons in the .ini changes them)\n\n"
   "F1 = menu   F3 = screenshot   F4 = FPS limit 60 / unlimited   F5 = diagnostic dump (trace)\n"
   "F7 = record .mp4 video (press F7 again to stop; saved in the recordings folder)\n"
   "F8 = instant full-resolution screenshot (PNG in the captures folder)\n"
   "F11 / Alt+Enter = fullscreen   Esc = quit";
 
-static u64 keymap(WPARAM k){
-  switch(k){ case 'X': case VK_SPACE: return 1ull<<0; case 'Z': return 1ull<<1; case 'C': return 1ull<<2; case 'V': return 1ull<<3;
-    case 'Q': return 1ull<<6; case 'E': return 1ull<<7; case '1': return 1ull<<8; case '3': return 1ull<<9;
-    case VK_RETURN: return 1ull<<10; case VK_BACK: return 1ull<<11;
-    case VK_LEFT: return 1ull<<12; case VK_UP: return 1ull<<13; case VK_RIGHT: return 1ull<<14; case VK_DOWN: return 1ull<<15;
-    /* stick keys, turned into axes later */
-    case 'A': return 1ull<<40; case 'W': return 1ull<<41; case 'D': return 1ull<<42; case 'S': return 1ull<<43;
-    case 'J': return 1ull<<44; case 'I': return 1ull<<45; case 'L': return 1ull<<46; case 'K': return 1ull<<47; }
-  return 0; }
+/* key messages -> input_kbm.c key codes (its [Input] key_* bindings map them to the controller). Letters and digits
+   follow the layout (their VK codes are their ASCII); punctuation goes by the key's place (its scan code), named as
+   on a US keyboard, since layouts put different characters there */
+static int kbm_from_vk(WPARAM k, LPARAM l){
+  if((k>='A' && k<='Z') || (k>='0' && k<='9')) return (int)k;
+  if(k>=VK_NUMPAD0 && k<=VK_NUMPAD9) return KBM_KEY_NUM0+(int)(k-VK_NUMPAD0);
+  switch(k){
+    case VK_SPACE: return KBM_KEY_SPACE;
+    case VK_RETURN: return KBM_KEY_ENTER;
+    case VK_BACK: return KBM_KEY_BACKSPACE;
+    case VK_LEFT: return KBM_KEY_LEFT;
+    case VK_UP: return KBM_KEY_UP;
+    case VK_RIGHT: return KBM_KEY_RIGHT;
+    case VK_DOWN: return KBM_KEY_DOWN;
+    case VK_TAB: return KBM_KEY_TAB;
+    case VK_SHIFT: return KBM_KEY_SHIFT;
+    case VK_CONTROL: return KBM_KEY_CTRL;
+    case VK_MENU: return KBM_KEY_ALT;
+    case VK_CAPITAL: return KBM_KEY_CAPSLOCK;
+    case VK_INSERT: return KBM_KEY_INSERT;
+    case VK_DELETE: return KBM_KEY_DELETE;
+    case VK_HOME: return KBM_KEY_HOME;
+    case VK_END: return KBM_KEY_END;
+    case VK_PRIOR: return KBM_KEY_PAGEUP;
+    case VK_NEXT: return KBM_KEY_PAGEDOWN;
+    case VK_ADD: return KBM_KEY_NUM_ADD;
+    case VK_SUBTRACT: return KBM_KEY_NUM_SUB;
+    case VK_MULTIPLY: return KBM_KEY_NUM_MUL;
+    case VK_DIVIDE: return KBM_KEY_NUM_DIV;
+    case VK_DECIMAL: return KBM_KEY_NUM_DECIMAL;
+  }
+  if(!(l & (1L<<24)))   /* not an extended key: the punctuation block, by scan code (PC set 1) */
+    switch((l>>16) & 0xFF){
+      case 0x29: return KBM_KEY_GRAVE;
+      case 0x0C: return KBM_KEY_DASH;
+      case 0x0D: return KBM_KEY_EQUALS;
+      case 0x1A: return KBM_KEY_LBRACKET;
+      case 0x1B: return KBM_KEY_RBRACKET;
+      case 0x2B: return KBM_KEY_BACKSLASH;
+      case 0x27: return KBM_KEY_SEMICOLON;
+      case 0x28: return KBM_KEY_APOSTROPHE;
+      case 0x33: return KBM_KEY_COMMA;
+      case 0x34: return KBM_KEY_PERIOD;
+      case 0x35: return KBM_KEY_SLASH;
+    }
+  return KBM_KEY_NONE; }
+
+/* mouse look: hold the cursor inside the client area (Windows drops the clip when the window loses focus or moves) */
+static void cursor_clip(HWND h, int on){
+  if(on){ RECT c; GetClientRect(h,&c); MapWindowPoints(h,NULL,(POINT*)&c,2); ClipCursor(&c); }
+  else if(g_cursor_clipped) ClipCursor(NULL);
+  g_cursor_clipped=on; }
 
 extern int fe_wndproc(void* h, unsigned m, unsigned long long w, long long l, long long* result);   /* beyond_ui/fe.cpp */
 extern int ov_wndproc(void* h, unsigned m, unsigned long long w, long long l);   /* beyond_ui/ov.cpp: 1 = the menu took it */
@@ -231,6 +277,8 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l){
   if(m==WM_SIZE){ g_ww=LOWORD(l); g_wh=HIWORD(l); if(g_ww<1) g_ww=1; if(g_wh<1) g_wh=1; }
   if(g_fe_mode){ long long r=0; if(fe_wndproc(h,m,w,l,&r)) return (LRESULT)r; return DefWindowProcA(h,m,w,l); }
   if(m==WM_APP+11){ set_fullscreen((int)w); return 0; }
+  /* the in-game menu's press-a-key rebinding sees keys first, so the key being bound doesn't also act in the menu */
+  if((m==WM_KEYDOWN||m==WM_SYSKEYDOWN||m==WM_KEYUP||m==WM_SYSKEYUP) && kbm_capture_key(kbm_from_vk(w,l),m==WM_KEYDOWN||m==WM_SYSKEYDOWN)) return 0;
   if(!(m==WM_KEYDOWN && w==VK_F11) && !(m==WM_SYSKEYDOWN && w==VK_RETURN) && ov_wndproc(h,m,w,l)) return 0;
   switch(m){
   case WM_CLOSE: LOG("window: closed by the user or the system\n"); g_quit=1; return 0;
@@ -250,37 +298,37 @@ static LRESULT CALLBACK wndproc(HWND h, UINT m, WPARAM w, LPARAM l){
     if(0){ MessageBoxA(h,HELP,"Metroid Prime 4 Beyond",MB_OK); }
     if(w==VK_F3){ g_shot_req=1; return 0; }
     if(w==VK_F7){ g_rec_toggle=1; return 0; }
-    if(w==VK_TAB){ if(!(l & (1L<<30))){ extern volatile int g_ff_presses; g_ff_presses++; } return 0; }   /* fast forward toggle (fast_forward=1) */
+    if(w==VK_TAB && g_opt_ff){ if(!(l & (1L<<30))){ extern volatile int g_ff_presses; g_ff_presses++; } return 0; }   /* fast forward toggle (fast_forward=1); else a bindable key */
     if(w==VK_F8){ extern volatile int g_shot8_req; g_shot8_req=1; return 0; }
     if(w==VK_F5){ extern void gpu_gl_dump_rts(void); extern void kernel_dump_threads(void); extern __thread FILE* g_log_redirect;
       CreateDirectoryA("captures",NULL); FILE* f=fopen("captures/threads.txt","w");   /* written next to the trace */
       if(f){ g_log_redirect=f; kernel_dump_threads(); g_log_redirect=NULL; fclose(f); }
       kernel_dump_threads(); gpu_gl_dump_rts(); return 0; }
     if(w==VK_F4){ if(l & (1L<<30)) return 0; g_opt_fps= g_opt_fps==0? 1 : 0; char t[64]; snprintf(t,sizeof t,"FPS limit: %s",g_opt_fps==0? "unlimited" : "60"); SetWindowTextA(h,t); LOG("settings: F4 fps_limit=%d\n",g_opt_fps); { extern void ini_set(const char*, const char*); char v[8]; snprintf(v,sizeof v,"%d",g_opt_fps); ini_set("fps_limit",v); } return 0; }
-    keys_held|=keymap(w);if(test_tap_sample)keys_tapped|=keymap(w); return 0;
-  case WM_SYSKEYUP: case WM_KEYUP: keys_held&=~keymap(w); return 0;
-  case WM_KILLFOCUS: keys_held=0;keys_tapped=0; InterlockedExchange(&g_mbtn,0); ClipCursor(NULL); ReleaseCapture(); return 0;
+    kbm_key(kbm_from_vk(w,l),1); return 0;
+  case WM_SYSKEYUP: case WM_KEYUP: kbm_key(kbm_from_vk(w,l),0); return 0;   /* also keeps a lone Alt from opening the window menu */
+  case WM_KILLFOCUS: kbm_release_all(); g_mouse_down=0; cursor_clip(h,0); ReleaseCapture(); return 0;
+  case WM_APP+12: cursor_clip(h,(int)w); return 0;   /* mouse look on / off, from video_poll */
+  case WM_APP+13: { POINT p; if(GetCursorPos(&p) && WindowFromPoint(p)==h) SendMessageA(h,WM_SETCURSOR,(WPARAM)h,MAKELPARAM(HTCLIENT,WM_MOUSEMOVE)); return 0; }   /* the menu opened or closed: show or hide the cursor now, not at the next mouse move */
   case WM_APP+8: { char t[300]; if(w) snprintf(t,sizeof t,"%s  |  RECORDING (F7 to stop)",g_title); else snprintf(t,sizeof t,"%s  |  Video saved in the recordings folder",g_title); SetWindowTextA(h,t); return 0; }
   case WM_APP+10: { char t[400]; char* s=(char*)l; if(s){ snprintf(t,sizeof t,"%s  |  %s",g_title,s); free(s); } else snprintf(t,sizeof t,"%s",g_title); SetWindowTextA(h,t); return 0; }   /* backend_status_win */
   case WM_APP+9: { char t[160]; if(w) snprintf(t,sizeof t,"%s  |  FAST FORWARD x%d (Tab or L3+R3)",g_title,(int)l); else snprintf(t,sizeof t,"%s",g_title); SetWindowTextA(h,t); return 0; }
   case WM_APP+7: { char t[160]; if(w) snprintf(t,sizeof t,"%s  |  LSFG ON x%d (frame generation)",g_title,(int)l); else snprintf(t,sizeof t,"%s  |  LSFG standby",g_title); SetWindowTextA(h,t); return 0; }
   case WM_INPUT: { RAWINPUT ri; UINT sz=sizeof ri;
       if(GetRawInputData((HRAWINPUT)l,RID_INPUT,&ri,&sz,sizeof(RAWINPUTHEADER))!=(UINT)-1 && ri.header.dwType==RIM_TYPEMOUSE &&
-         !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)){ InterlockedExchangeAdd(&g_mdx,ri.data.mouse.lLastX); InterlockedExchangeAdd(&g_mdy,ri.data.mouse.lLastY); }
+         !(ri.data.mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) kbm_mouse_motion((int)ri.data.mouse.lLastX,(int)ri.data.mouse.lLastY);
       break; }   /* DefWindowProc cleans up after the read */
   case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN: case WM_XBUTTONDOWN:
   case WM_LBUTTONUP: case WM_RBUTTONUP: case WM_MBUTTONUP: case WM_XBUTTONUP: {
-      LONG bit= (m==WM_LBUTTONDOWN||m==WM_LBUTTONUP)? 1 : (m==WM_RBUTTONDOWN||m==WM_RBUTTONUP)? 2 : (m==WM_MBUTTONDOWN||m==WM_MBUTTONUP)? 4
-              : (HIWORD(w)==XBUTTON1? 8 : 16);
+      int button= (m==WM_LBUTTONDOWN||m==WM_LBUTTONUP)? KBM_MOUSE_LEFT : (m==WM_RBUTTONDOWN||m==WM_RBUTTONUP)? KBM_MOUSE_RIGHT
+                : (m==WM_MBUTTONDOWN||m==WM_MBUTTONUP)? KBM_MOUSE_MIDDLE : (HIWORD(w)==XBUTTON1? KBM_MOUSE_BACK : KBM_MOUSE_FORWARD);
       int down= m==WM_LBUTTONDOWN||m==WM_RBUTTONDOWN||m==WM_MBUTTONDOWN||m==WM_XBUTTONDOWN;
-      LONG now= down? (g_mbtn|bit) : (g_mbtn&~bit); InterlockedExchange(&g_mbtn,now);
-      extern int mouse_aim_button(void);
-      if(now && GetCapture()!=h) SetCapture(h); else if(!now) ReleaseCapture();   /* releases still arrive outside the window */
-      if(down && (bit&mouse_aim_button())){ RECT c; GetClientRect(h,&c); MapWindowPoints(h,NULL,(POINT*)&c,2); ClipCursor(&c); }   /* aiming: the cursor stays in */
-      else if(!down && (bit&mouse_aim_button())) ClipCursor(NULL);
+      kbm_mouse_button(button,down);
+      g_mouse_down= down? (g_mouse_down|1<<button) : (g_mouse_down&~(1<<button));
+      if(g_mouse_down && GetCapture()!=h) SetCapture(h); else if(!g_mouse_down) ReleaseCapture();   /* releases still arrive outside the window */
       return (m==WM_XBUTTONDOWN||m==WM_XBUTTONUP)? TRUE : 0; }
   case WM_SETCURSOR: if(LOWORD(l)==HTCLIENT && ov_is_open()){ SetCursor(LoadCursor(NULL,IDC_ARROW)); return TRUE; }
-    { extern int g_opt_mouse_aim; if(g_opt_mouse_aim && LOWORD(l)==HTCLIENT){ SetCursor(NULL); return TRUE; } }   /* free aim: no cursor over the game */
+    if(kbm_mouse_look_enabled() && LOWORD(l)==HTCLIENT){ SetCursor(NULL); return TRUE; }   /* mouse look: no cursor over the game */
     if(g_fullscreen && LOWORD(l)==HTCLIENT){ SetCursor(NULL); return TRUE; } break;
   }
   return DefWindowProcA(h,m,w,l);
@@ -306,7 +354,6 @@ static void win_thread(void* arg){
   if(arg){   /* front end first, in this window; the game continues in it after Play */
     g_fe_mode=1; g_fe_result=fe_run(g_hwnd); g_fe_mode=0;
     if(g_fe_result){ SetEvent(g_fe_done); return; }   /* the process ends */
-    if(g_fullscreen) ShowCursor(FALSE);   /* the front end kept the cursor visible in fullscreen */
     SetEvent(g_fe_done); WaitForSingleObject(g_video_go,INFINITE);
     { /* The front end drew with a D3D11 flip-model swapchain. Once DXGI has had such a swapchain on a window, OpenGL
          and Vulkan presents to that window never reach the screen (MEASURED 2026-10-22: after Play the Play screen
@@ -316,7 +363,7 @@ static void win_thread(void* arg){
       if(fs) wp=g_wp; else GetWindowPlacement(old,&wp);   /* fullscreen: the windowed placement it was entered from */
       HWND nw=CreateWindowA("MetroidPrime4RecompWnd",g_title,WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,1280,720,NULL,NULL,hi,NULL);
       if(nw){ g_fe_hwnd=old; g_hwnd=nw;
-        if(fs){ wp.showCmd=SW_HIDE; SetWindowPlacement(nw,&wp); g_fullscreen=0; ShowCursor(TRUE); set_fullscreen(1); }   /* as F11 does: borderless over the monitor, g_wp saved */
+        if(fs){ wp.showCmd=SW_HIDE; SetWindowPlacement(nw,&wp); g_fullscreen=0; set_fullscreen(1); }   /* as F11 does: borderless over the monitor, g_wp saved */
         else SetWindowPlacement(nw,&wp);   /* normal or maximized, as the player left it */
         ShowWindow(nw,SW_SHOW); SetForegroundWindow(nw);
         ShowWindow(old,SW_HIDE); DestroyWindow(old);
@@ -333,7 +380,7 @@ static void win_thread(void* arg){
   { extern int g_snxvk_want; if(!g_snxvk_want) set_pixel_format(g_hdc); }   /* native Vulkan: no GL pixel format on its window (set later if it falls back) */
   if(g_want_fs) set_fullscreen(1);
   ShowWindow(g_hwnd,SW_SHOW);
-  { RAWINPUTDEVICE d={1,2,0,g_hwnd}; if(!RegisterRawInputDevices(&d,1,sizeof d)) LOG("input: raw mouse input unavailable: no mouse free aim\n"); }   /* generic desktop mouse */
+  { RAWINPUTDEVICE d={1,2,0,g_hwnd}; if(!RegisterRawInputDevices(&d,1,sizeof d)) LOG("input: raw mouse input unavailable: no mouse look\n"); }   /* generic desktop mouse */
   ls_launch();
   SetEvent(g_ready);
   MSG msg; while(GetMessageA(&msg,NULL,0,0)>0){ TranslateMessage(&msg); DispatchMessageA(&msg); }
@@ -342,7 +389,6 @@ static void win_thread(void* arg){
 
 void video_init(const char* title){
   { extern void (*g_backend_status)(const char*); g_backend_status=backend_status_win; }
-  test_tap_sample=getenv("SWR_AUTOMATION_INPUT")!=NULL;
   snprintf(g_title,sizeof g_title,"%s",title);
   xinput_load(); sdl_load(); timeBeginPeriod(1);
   if(!g_win_started){ g_ready=CreateEventA(NULL,TRUE,FALSE,NULL); _beginthread(win_thread,1<<20,NULL); }
@@ -429,8 +475,6 @@ void backend_window_size(int* w, int* h){ *w=g_ww; *h=g_wh; }
 
 void video_present_rgba(const u32* px, int w, int h, int stride){ extern void gpu_gl_present_cpu(const u32*,int,int,int); gpu_gl_present_cpu(px,w,h,stride); }
 
-static i32 axis(u64 b, int neg, int pos){ return ((b>>pos)&1? 32767:0) - ((b>>neg)&1? 32767:0); }
-
 static i32 dz(i32 v){ return (v>-7000 && v<7000)? 0 : v; }
 
 
@@ -465,50 +509,20 @@ static void test_input_apply(u64*b,i32*lx,i32*ly,i32*rx,i32*ry){
   }
 }
 
-/* Mouse free aim. Free aim follows the left stick while L is held: while the mouse button set to l
-   (right by default) is held, the mouse moves a virtual stick, which turns the aim. It starts centred (the arm points
-   ahead), the mouse pushes it, and it stays where it was pushed (a stick needs no holding): ~150 counts at 100%
-   sensitivity swing it from centre to the edge. The other mouse buttons press their Switch buttons */
-static int g_mb_bit[5]={-2,-2,-2,-2,-2};   /* -2 not parsed yet, -1 none */
-void mouse_map_reset(void){ g_mb_bit[0]=-2; }
-static void mouse_map(void){
-  if(g_mb_bit[0]!=-2) return;
-  extern char g_opt_mouse_buttons[]; static const struct { const char* n; int bit; } N[]={{"a",0},{"b",1},{"x",2},{"y",3},
-    {"lstick",4},{"rstick",5},{"l",6},{"r",7},{"zl",8},{"zr",9},{"plus",10},{"minus",11}};
-  const char* p=g_opt_mouse_buttons;
-  for(int i=0;i<5;i++){ char t[16]; int k=0; while(*p==' ') p++; while(*p && *p!=',' && k<15) t[k++]=(char)tolower((unsigned char)*p++); t[k]=0; if(*p==',') p++;
-    g_mb_bit[i]=-1; for(size_t j=0;j<sizeof N/sizeof *N;j++) if(!strcmp(t,N[j].n)) g_mb_bit[i]=N[j].bit; } }
-int mouse_aim_button(void){ mouse_map(); int m=0; for(int i=0;i<5;i++) if(g_mb_bit[i]==6) m|=1<<i; return m; }   /* the mouse buttons set to L */
-/* test only: SWR_TEST_MOUSE="FRAME:DX,DY,BUTTONS;..." adds that movement at that guest frame and holds those buttons
-   (hex, 1 left 2 right 4 middle) from there to the next entry */
-static void mouse_test(LONG* dx, LONG* dy, LONG* btn){
-  static const char* s; static int init, held; if(!init){ init=1; s=getenv("SWR_TEST_MOUSE"); }
-  if(!s) return; extern int g_frames;
-  while(*s){ char* e; long f=strtol(s,&e,10); if(e==s || *e!=':' || g_frames<f) break;
-    long x=strtol(e+1,&e,10); if(*e==',') e++; long y=strtol(e,&e,10); if(*e==',') e++; long b=strtol(e,&e,16);
-    *dx+=x; *dy+=y; held=(int)b; s= *e==';'? e+1 : e; }
-  *btn|=held; }
-static void mouse_apply(u64* b, i32* lx, i32* ly){
-  extern int g_opt_mouse_aim, g_opt_mouse_sens;
-  LONG dx=InterlockedExchange(&g_mdx,0), dy=InterlockedExchange(&g_mdy,0), btn=g_mbtn;
-  static float vx, vy; static int was;
-  mouse_test(&dx,&dy,&btn);
-  if(!g_opt_mouse_aim){ was=0; return; }
-  mouse_map();
-  for(int i=0;i<5;i++) if((btn>>i&1) && g_mb_bit[i]>=0) *b|=1ull<<g_mb_bit[i];
-  int aiming=(btn & mouse_aim_button())!=0;
-  if(aiming){
-    if(!was) vx=vy=0;
-    float s=(float)g_opt_mouse_sens/100.0f/150.0f;
-    vx+=(float)dx*s; vy-=(float)dy*s;   /* screen y is down, the stick's up */
-    float m=sqrtf(vx*vx+vy*vy); if(m>1.0f){ vx/=m; vy/=m; m=1.0f; }
-    if(m>=0.25f){ *lx=(i32)(vx/m*32767.0f); *ly=(i32)(vy/m*32767.0f); } else *lx=*ly=0;   /* aimed: full tilt that way */
-    { static int said; if(!said){ said=1; LOG("input: mouse free aim in use\n"); } } }
-  was=aiming; }
+/* mouse look holds the cursor in the window while the game has the mouse: the window focused, the menu closed */
+static void cursor_sync(void){
+  static int clipped=-1; static u64 last;
+  int want= kbm_mouse_look_enabled() && !ov_is_open() && GetForegroundWindow()==g_hwnd;
+  u64 now=plat_ns();
+  if(want==clipped && !(want && now-last>500000000ull)) return;   /* while on, renewed twice a second: the window may have moved */
+  clipped=want; last=now; PostMessageA(g_hwnd,WM_APP+12,(WPARAM)want,0); }
+static void cursor_menu_sync(void){
+  static int was=-1; int open=ov_is_open();
+  if(open!=was){ was=open; PostMessageA(g_hwnd,WM_APP+13,0,0); } }
 
 void video_poll(void){
-  u64 k=keys_held|keys_tapped, b=0;keys_tapped=0;
-  i32 lx=axis(k,40,42), ly=axis(k,43,41), rx=axis(k,44,46), ry=axis(k,47,45);
+  u64 k=0, b=0; i32 lx, ly, rx, ry;
+  kbm_keyboard(&k,&lx,&ly,&rx,&ry);
   int sdl_on=sdl_poll(&b,&lx,&ly,&rx,&ry);
   extern int g_opt_ctrl_api;
   { static int seen; if(sdl_on && !(seen&1) && (b&0xFFFF)){ seen|=1; LOG("input: first button press seen through SDL2\n"); } }
@@ -533,11 +547,12 @@ void video_poll(void){
   if(g_script[0]){ /* test input like the X11 backend: "ms:hex,ms:hex,..." holds those buttons for 300 ms */
     u64 el=(plat_ns()-g_start)/1000000ull; const char* p=g_script;
     while(*p){ u64 t=strtoull(p,(char**)&p,10); if(*p!=':') break; p++; u64 m=strtoull(p,(char**)&p,16); if(el>=t && el<t+300){ b|=m; if(m&(1ull<<16))lx=-32767; if(m&(1ull<<18))lx=32767; if(m&(1ull<<17))ly=32767; if(m&(1ull<<19))ly=-32767; if(m&(1ull<<20))rx=-32767; if(m&(1ull<<22))rx=32767; if(m&(1ull<<21))ry=32767; if(m&(1ull<<23))ry=-32767; } if(*p==',') p++; } }
+  kbm_mouse(&b,&rx,&ry,!ov_is_open());   /* the menu uses the mouse itself while open */
+  cursor_sync(); cursor_menu_sync();
   test_input_apply(&b,&lx,&ly,&rx,&ry);
   if(test_replay){ phys=b; plx=lx; ply=ly; }   /* tests drive the menu with the replayed buttons */
   { extern int ov_pad(unsigned long long phys, int lx, int ly);   /* beyond_ui/ov.cpp: 1 = the menu has the controller */
     if(ov_pad(phys,plx,ply)){ b=0; lx=ly=rx=ry=0; } }
-  if(!ov_is_open()) mouse_apply(&b,&lx,&ly);   /* the menu uses the mouse itself while open */
   { /* rumble (svc_hid.c hid_rumble_get) to the pads input comes from: on a change, else refreshed every 100 ms
        (SDL's rumble runs for the duration given, so it stops by itself when the game stops sending) */
     extern void hid_rumble_get(float*,float*); float lo, hi; hid_rumble_get(&lo,&hi);

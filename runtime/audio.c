@@ -315,7 +315,10 @@ void audio_render(SvcObj*o,const u32*ih,const u8*input,u64 size,const u8*voices,
   audio_eos_env();
   if(!o->u[4]){ARenderer*r=calloc(1,sizeof *r);if(!r)return;r->voices=calloc(AV,sizeof(AVoice));r->samples=calloc(AM*24*AF,sizeof(float));if(!r->voices||!r->samples){free(r->voices);free(r->samples);free(r);return;}o->u[4]=(u64)(size_t)r;}
   ARenderer*r=(ARenderer*)(size_t)o->u[4];aroutes(r,ih,input,size);aroute_trace(r,ih,input,size,voices,count);memset(r->samples,0,AM*24*AF*sizeof(float));u32 active=0;
-  for(u32 i=0;i<count;i++){const u8*vi=voices+i*0x170;u32 id=au32(vi)&(AV-1);AVoice*v=&r->voices[id];u8 in_use=vi[9],play=vi[0xA];
+  /* A voice's state belongs to its slot in the update, as on the console: unused slots carry id 0, and keying the state
+     by id let each of them clear voice 0 ("not in use"). In Metroid Prime 4 that is the music's left channel: 5 ms of
+     every 4.8 s buffer played, the rest dropped, so the sound came out of the right side only */
+  for(u32 i=0;i<count;i++){const u8*vi=voices+i*0x170;u32 id=au32(vi)&(AV-1);AVoice*v=&r->voices[i&(AV-1)];u8 in_use=vi[9],play=vi[0xA];
     if(vi[8]){atrace_voice("new",id,v,vi,NULL);aclear(v,1);memset(v,0,sizeof *v);}
     if(!in_use){if(v->nq){atrace_voice("unused",id,v,vi,NULL);aclear(v,1);}v->was_playing=0;}
     else{

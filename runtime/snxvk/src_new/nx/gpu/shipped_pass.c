@@ -3,11 +3,7 @@
 #include "nx/gpu/shipped_pass.h"
 #include "nx/gpu/shader/shader.h"
 #include "nx/gpu/shader/shipped.h"
-/* SWR: the two RomFS readers this walk uses (nx/hle/filesystem/fs.h declares them; including it pulls in the game-dump
-   driver, which this build has no use for). runtime/snxvk_glue.c provides them */
-typedef int (*RomfsEach)(void* ctx, const char* name, u64 off, u64 size);
-int romfs_files(RomfsEach each, void* ctx);
-int romfs_peek(u64 off, void* dst, u64 size);
+#include "nx/hle/filesystem/fs.h"
 #include "nx/runtime/loader.h"
 #include <stdarg.h>
 #include <stdio.h>
@@ -18,6 +14,8 @@ int romfs_peek(u64 off, void* dst, u64 size);
 #define HELD_MAX  (1024ull << 20) /* the bytes the walk reads into at once, a file's and its streams' */
 #define KEPT_MAX  (256ull << 20)  /* the hits' bytes kept from counting to translating; past this, read again */
 #define TABLE_MAX (16u << 20)     /* a SARC's tables past this aren't read to see what it holds */
+
+const char* ship_walk_version(void) { return SNX_SHIP_WALK; }
 
 /* a file or segment to look in */
 typedef struct {
@@ -35,10 +33,12 @@ static struct {
     u32 nseg;
 } g_shipped_pass;
 
-static int snapshot_seg(void* ctx, const char* name, const u8* bytes, u64 gva, u64 size, int writable) {
+static int snapshot_seg(void* ctx, const char* name, size_t name_len, const u8* bytes, u64 gva, u64 size,
+                        int writable) {
     Segment* seg = realloc(g_shipped_pass.seg, (g_shipped_pass.nseg + 1) * sizeof *seg);
     Segment* s;
     (void)ctx;
+    (void)name_len;
     if (!seg) return 1;
     g_shipped_pass.seg = seg;
     s = &seg[g_shipped_pass.nseg];
@@ -145,7 +145,7 @@ static int hold(Walk* w, u64 n) { /* 0, or -1 when n more bytes would pass HELD_
 static void unhold(Walk* w, u64 n) { w->held -= n; }
 
 /* each program found: counted, or handed to the sink */
-static int each_program(void* ctx, const u8* sph, size_t avail, int stage) {
+static int each_program(void* ctx, const u8* sph, size_t avail, int stage, const u8* consts, size_t nconsts) {
     Walk* w = ctx;
     if (stopped(w)) return 1;
     w->found++;
@@ -154,7 +154,7 @@ static int each_program(void* ctx, const u8* sph, size_t avail, int stage) {
         return 0;
     }
     __atomic_add_fetch(&w->progress->programs_done, 1, __ATOMIC_RELAXED);
-    switch (w->sink->program(w->sink->ctx, sph, avail, stage)) {
+    switch (w->sink->program(w->sink->ctx, sph, avail, stage, consts, nconsts)) {
         case SHIP_NEW: w->made++; break;
         case SHIP_KNOWN: w->known++; break;
         case SHIP_SKIPPED:
@@ -270,21 +270,27 @@ static int scan_source(Walk* w, const u8* d, size_t n, int kind) {
     int rc = kind == SHIPPED_YAZ0 ? scan_yaz0(w, d, n, 0) : scan_bytes(w, d, n, 0);
     return w->lacked > lacked ? -1 : rc; /* a program not handled for want of memory: the source isn't read */
 }
-/* what a source holds, by its name, then by its first bytes: SHIPPED_SKIP, -1 when its first bytes couldn't be read,
-   or its kind and its id in the scan records (its name, place, size and first bytes) */
-static int source_kind(const Source* s, u64* id) {
+/* a source's name, place and size mixed: a file's id in the SHIP_NONE records, which reading none of it tells */
+static u64 place_of(const Source* s) {
+    u64 h = 0xCBF29CE484222325ull;
+    return mix(mix(mix(h, s->name, strlen(s->name)), &s->off, sizeof s->off), &s->size, sizeof s->size);
+}
+/* what a source holds, by its first bytes: -1 when they couldn't be read, or its kind and its id in the SHIP_FILE
+   records (its place, place_of's, and first bytes) */
+static int source_kind(const Source* s, u64 place, u64* id) {
     u8 head[SHIPPED_HEAD] = {0};
     size_t n = s->size < sizeof head ? (size_t)s->size : sizeof head;
-    u64 h = 0xCBF29CE484222325ull;
     if (s->mem)
         memcpy(head, s->mem, n);
-    else if (shipped_name_skips(s->name))
-        return SHIPPED_SKIP;
     else if (romfs_peek(s->off, head, n))
         return -1;
-    h = mix(mix(mix(h, s->name, strlen(s->name)), &s->off, sizeof s->off), &s->size, sizeof s->size);
-    *id = mix(h, head, n);
+    *id = mix(place, head, n);
     return s->mem ? SHIPPED_SCAN : shipped_kind(head, n);
+}
+/* a source the walk translates nothing from, marked read: a file for every build (SHIP_NONE, by its place), a segment
+   for this one (whose name, place and size an update of the game keeps more often than a file's) */
+static void read_nothing(Walk* w, const Source* s, u64 id, u64 place) {
+    w->sink->mark(w->sink->ctx, s->mem ? SHIP_FILE : SHIP_NONE, s->mem ? id : place);
 }
 /* a source's programs as counted (since: the stages' counts before it): how many on the screen, by stage in the log */
 static void note_counted(Walk* w, const char* name, const u32* since) {
@@ -367,26 +373,33 @@ int ship_walk(const ShipSink* sink, ShipProgress* progress, int count) {
     for (i = 0; i < w.nsrc && !stopped(&w); i++) {
         const Source* s = &w.src[i];
         u32 found = w.found, since[ST_CS + 2], before[4] = {w.made, w.known, w.skipped + w.lone, w.failed};
-        u64 id = 0;
+        u64 id = 0, place = place_of(s);
         u8* owned;
         const u8* d;
-        int kind = source_kind(s, &id), got, rc;
+        int kind, got, rc;
         __atomic_add_fetch(&progress->files_seen, 1, __ATOMIC_RELAXED);
+        /* a file of a kind skipped by its name, or that an earlier run of this walk found nothing in: none of it read */
+        if (!s->mem && (shipped_name_skips(s->name) || sink->scanned(sink->ctx, SHIP_NONE, place))) continue;
+        kind = source_kind(s, place, &id);
         if (kind < 0) {
             w.unread++;
             continue;
         }
-        if (kind == SHIPPED_SKIP || sink->scanned(sink->ctx, SHIP_FILE, id)) continue;
-        if (s->size > FILE_MAX) { /* marked read: no run of this build reads it */
+        if (kind == SHIPPED_SKIP) { /* no container its first bytes name */
+            read_nothing(&w, s, id, place);
+            continue;
+        }
+        if (sink->scanned(sink->ctx, SHIP_FILE, id)) continue;
+        if (s->size > FILE_MAX) { /* marked read: no run of this walk reads it */
             w.big++;
-            sink->mark(sink->ctx, SHIP_FILE, id);
+            read_nothing(&w, s, id, place);
             continue;
         }
         memcpy(since, w.stages, sizeof since);
         got = source_bytes(&w, s, kind, &d, &owned);
         if (got != BYTES_OK) { /* a Yaz0 file whose start says it has no programs is marked read */
             if (got == BYTES_NONE)
-                sink->mark(sink->ctx, SHIP_FILE, id);
+                read_nothing(&w, s, id, place);
             else
                 w.unread++;
             continue;
@@ -396,7 +409,7 @@ int ship_walk(const ShipSink* sink, ShipProgress* progress, int count) {
             if (rc)
                 w.unread++;
             else
-                sink->mark(sink->ctx, SHIP_FILE, id);
+                read_nothing(&w, s, id, place);
         } else if (w.counting) {
             if (add_hit(&w, &hit, &nhit, i, kind, id, &owned)) w.unread++;
             note_counted(&w, s->name, since);

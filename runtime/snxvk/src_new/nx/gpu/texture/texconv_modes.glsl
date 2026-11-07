@@ -16,7 +16,7 @@
 #define TC_S8D24 5u /* stencil in the low 8 bits, depth the top 24 */
 #define TC_D24X8 6u /* depth in the low 24 bits, stencil 0 */
 #define TC_D32S8 7u /* 8 bytes: float depth, then the stencil byte */
-/* ETC2 and EAC 4x4 blocks to pixels, a block an invocation (gpu/texture/etc2.c is the reference) */
+/* ETC2 and EAC 4x4 blocks to pixels, a block an invocation (tests/support/etc2.c is the reference) */
 #define TC_ETC2_RGB 8u
 #define TC_ETC2_PTA 9u
 #define TC_ETC2_RGBA 10u
@@ -44,5 +44,40 @@
    bpp bytes (remap) from the source pixel its column and row name in two tables in the input (words from const_a: a
    column's source column, from const_b: a row's source row). Source rows are in_pitch bytes apart from in_bias */
 #define TC_BLIT 22u
+/* BC1 to BC7 4x4 blocks to pixels, a block an invocation (tests/support/bcn.c is the reference): RGBA8 for BC1 to BC3
+   and BC7, 16 bit unorm or snorm channels for BC4 and BC5, RGBA16F for BC6H */
+#define TC_BC1 23u
+#define TC_BC2 24u
+#define TC_BC3 25u
+#define TC_BC4 26u
+#define TC_BC4_SNORM 27u
+#define TC_BC5 28u
+#define TC_BC5_SNORM 29u
+#define TC_BC6H_UF 30u
+#define TC_BC6H_SF 31u
+#define TC_BC7 32u
+/* TC_BLIT between float formats (gpu.h's GPU_BLIT_FLOAT, in remap): the source pixel's components as floats, 0 where it
+   has none and its alpha 1, each into the destination's, rounded to the nearest half (ties to even) for a half. An
+   invocation owns an output word (line_out bytes a row, the last word's bytes past it left) */
+#define TC_BLIT_FLOAT 33u
+/* index buffers the 3D engine's draws read that Vulkan can't (vk/render.c): element e of line_out, units an element
+   row (gl_GlobalInvocationID.y counts rows, as a row of workgroups holds 4 million at most). in_bias counts bytes
+   here and is a multiple of 4; out_bias counts words. The restart index is const_a */
+/* 8-bit indices to 16-bit ones, a pair a word an invocation: each equal to const_a becomes 0xFFFF when remap is
+   nonzero (the restart index is on) */
+#define TC_INDEX_WIDEN8 34u
+/* 16 and 32-bit indices with the guest's restart index const_a made Vulkan's (all ones), a word an invocation */
+#define TC_INDEX_RESTART16 35u
+#define TC_INDEX_RESTART32 36u
+/* quads as two triangles each, (0 1 2) and (0 2 3), as 32-bit indices, a quad an invocation: from indices of remap
+   bytes (1, 2 or 4), or with remap 0 from the vertex numbers themselves */
+#define TC_INDEX_QUADS 37u
+/* a vertex stream whose stride (in_pitch bytes) Vulkan can't read made one it can (vk/render.c's restride): output word
+   e of line_out, as for the index modes, is word e % out_pitch of vertex e / out_pitch, the stream's bytes from that
+   vertex's start on, read past its stride into the next vertex as the guest's attributes do. The stream starts at
+   byte in_bias of the bound range, which holds every word its const_a bytes touch; bytes past them are 0 */
+#define TC_RESTRIDE 38u
+/* Nearest gather with normalized, packed or floating-point component conversion (pixel_format.h descriptors). */
+#define TC_BLIT_CONVERT 39u
 
 #endif
