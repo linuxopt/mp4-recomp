@@ -21,6 +21,7 @@ Everything that changed is listed below.
 - [Install and play](#install-and-play)
 - [Saves](#saves)
 - [Controls and the in-game menu](#controls-and-the-in-game-menu)
+- [Cheat support](#cheat-support)
 - [Performance on the test machine](#performance-on-the-test-machine)
 - [What changed](#what-changed)
   - [Rendering and visual fixes](#rendering-and-visual-fixes)
@@ -113,6 +114,24 @@ downloaded to a PC.
 - **F1** or the Home / Guide button opens the in-game menu (settings, cheats, FOV, upscaling).
 - **F3** saves a screenshot to `captures/`, **F4** toggles the 60 fps limit, **F5** writes a frame trace for bug
   reports, **F11** toggles fullscreen.
+
+## Cheat support
+
+Cheats are off by default and need the **Cheat codes** switch left on. Open them on the launcher's **Gameplay** page (scroll down) or on the **Cheats** page of the in-game menu (F1 or the Home / Guide button). Changes apply while the game is running.
+
+**Built-in cheats** for game build `8275FBE1EC5191C2`:
+
+| Group | Cheats |
+|---|---|
+| Ammo | Missiles, Super shots, Large shots and Power Bombs don't decrease; ammo and bike boost don't decrease; infinite elemental ammo; use any elemental shot; more green crystals (hold ZL while depositing) |
+| Samus | Infinite health; infinite jumps; speed booster (hold B to go faster); walk through walls (hold L for the other way); freeze the Flare Pool escape timer |
+| Combat | One-hit kills, bosses included; two-hit kills, not bosses; allies at full health; allies can't go down |
+
+The **Green Energy 10x** option is on the same page.
+
+Some of these are still being tested. Walk through walls can leave you stuck, so keep a separate save before using it.
+
+**Your own cheat files** use the Atmosphere (dmnt) format, so existing files work as they are. Put them at `~/.local/share/MetroidPrime4Recomp/Metroid Prime 4 Beyond_data/cheats/8275FBE1EC5191C2.txt`, then turn each cheat on in the in-game menu. Cheats that change game data work. Cheats that patch ARM instructions have no effect, because the game's code is recompiled.
 
 ## Performance on the test machine
 

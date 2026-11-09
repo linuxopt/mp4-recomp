@@ -1587,7 +1587,9 @@ static void bind_framebuffer(GpuChannel* ch){
   g_nrt=n;
   g_zt=NULL;
   if(r[0x54E]){ u64 za=((u64)r[0x3F8]<<32)|r[0x3F9]; u32 zw=r[0x48A], zh=r[0x48B];
-    if(za && zw && zh) g_zt=rt_texture(za,zw,zh,r[0x3FA],r[0x3FB],1); }
+    /* the 2D engine's copy of a depth-stencil (dsa_copy) can come back as the depth target: Prime 4's Control Beam tests against
+       such a copy of the scene's depth. A render target made for that address would be empty, and the whole beam failed its depth test */
+    if(za && zw && zh){ Tex* da=dsa_find(za); g_zt= da && da->f.depth && da->w==zw && da->h==zh? da : rt_texture(za,zw,zh,r[0x3FA],r[0x3FB],1); } }
   if(anylay && g_zt){ g_zt=NULL; static int said; if(!said){ said=1; LOG("gpu: layered draw with depth: drawn without depth\n"); } }
   if(g_zt){ g_zt->wgen++; g_zt->wtick=++g_wtick; }
   GLenum att= g_zt? (g_zt->f.fmt==GL_DEPTH_STENCIL? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT) : GL_DEPTH_STENCIL_ATTACHMENT;
