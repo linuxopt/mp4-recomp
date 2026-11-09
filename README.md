@@ -21,6 +21,7 @@ Everything that changed is listed below.
 - [Install and play](#install-and-play)
 - [Saves](#saves)
 - [Controls and the in-game menu](#controls-and-the-in-game-menu)
+- [Cheat support](#cheat-support)
 - [Performance on the test machine](#performance-on-the-test-machine)
 - [What changed](#what-changed)
   - [Rendering and visual fixes](#rendering-and-visual-fixes)
@@ -62,6 +63,27 @@ Everything that changed is listed below.
 
 ## Install and play
 
+### Windows
+
+1. Download `MetroidPrime4Recomp-PC-vYYYY.MM.DD.zip` from [releases](../../releases/latest) and extract it anywhere with
+   room, for example `D:\Games\`. You get a `Metroid Prime 4 Beyond` folder.
+2. Run **`Metroid Prime 4 Beyond.exe`** in it.
+3. **First run:** the setup screen asks for your game (its `.xci` / `.nsp` file, or an extracted folder) and the update
+   (its `.nsp`, or an extracted folder). Press **Start Setup**: it verifies the files, copies them into the game folder
+   and compiles the game with the bundled GCC (a few minutes on a fast CPU).
+4. Press **Play**. The first launch builds shaders in the background; later launches load them from the cache.
+
+Everything stays in the game folder, next to the EXE:
+
+| Path | What |
+|---|---|
+| `Metroid Prime 4 Beyond.ini` | settings, rewritten with every option explained on the first start |
+| `Metroid Prime 4 Beyond_data\` | the installed game data, saves, cheats and mods |
+| `shader_cache\` | compiled shaders |
+| `Metroid Prime 4 Beyond.log`, `setup.log` | logs for bug reports |
+
+### Linux (AppImage)
+
 1. Download `Metroid_Prime_4_Recomp-x86_64.AppImage` from the release and make it executable:
 
    ```bash
@@ -91,7 +113,8 @@ you started, checked against its SHA-256 and put in its place, and the launcher 
 kept as `<name>.previous` (UNDO puts it back). If the update changed the recompiler, the Play screen asks to rebuild
 the game code (a few minutes). Downloads use the system's libcurl (the `curl` package). With `skip_launcher=1` the
 check happens when you open the Play screen (`--launcher`). Builds before 2026-11-04 have no updater: download that
-release once by hand.
+release once by hand. The Windows build checks the same way: it downloads `update-<version>.zip` and `update.txt` from this
+repository's latest release, checks each file's size and SHA-256 and puts the new files in place.
 
 ## Saves
 
@@ -137,6 +160,30 @@ downloaded to a PC.
 - **F1** or the Home / Guide button opens the in-game menu (settings, cheats, FOV, upscaling).
 - **F3** saves a screenshot to `captures/`, **F4** toggles the 60 fps limit, **F5** writes a frame trace for bug
   reports, **F11** toggles fullscreen.
+
+## Cheat support
+
+Cheats are off by default and need the **Cheat codes** switch left on. Open them on the launcher's **Gameplay** page
+(scroll down) or on the **Cheats** page of the in-game menu (F1 or the Home / Guide button). Changes apply while the
+game is running.
+
+**Built-in cheats** for game build `8275FBE1EC5191C2`:
+
+| Group | Cheats |
+|---|---|
+| Ammo | Missiles, Super shots, Large shots and Power Bombs don't decrease; ammo and bike boost don't decrease; infinite elemental ammo; use any elemental shot; more green crystals (hold ZL while depositing) |
+| Samus | Infinite health; infinite jumps; speed booster (hold B to go faster); walk through walls (hold L for the other way); freeze the Flare Pool escape timer |
+| Combat | One-hit kills, bosses included; two-hit kills, not bosses; allies at full health; allies can't go down |
+
+The **Green Energy 10x** option is on the same page.
+
+Some of these are still being tested. Walk through walls can leave you stuck, so keep a separate save before using it.
+
+**Your own cheat files** use the Atmosphere (dmnt) format, so existing files work as they are. On Windows put them at
+`Metroid Prime 4 Beyond_data\cheats\8275FBE1EC5191C2.txt` in the game folder; on Linux at
+`~/.local/share/MetroidPrime4Recomp/Metroid Prime 4 Beyond_data/cheats/8275FBE1EC5191C2.txt`. Then turn each cheat on
+in the in-game menu. Cheats that change game data work. Cheats that patch ARM instructions have no effect, because the
+game's code is recompiled.
 
 ## Performance on the test machine
 
@@ -404,6 +451,16 @@ You need a 64-bit GCC (MinGW-w64), Python 3 and glslang:
 - **glslang:** from the [Vulkan SDK](https://vulkan.lunarg.com) (found through `VULKAN_SDK`), on `PATH`, or named with
   `set GLSLANG=C:\path\to\glslang.exe`.
 
+All four can be fetched at their pinned versions instead (winlibs GCC 14.2.0, Python 3.12, glslang 16.6.0, SDL2), each
+checked by SHA-256, into the folders `build.bat` looks in:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File windows\get_tools.ps1
+$env:GLSLANG = "$PWD\third_party\glslang\bin\glslang.exe"
+```
+
+Then:
+
 ```bat
 build.bat
 ```
@@ -422,6 +479,16 @@ The setup screen then works as on Linux: choose your `.xci` / `.nsp` and the upd
 `%USERPROFILE%\.switch` or where Ryujinx or yuzu keep it), or extracted folders. `SWR_PYTHON` names the Python to use
 when `python.exe` on `PATH` isn't the one you want.
 
+### Windows release
+
+`build.bat release X.Y.Z` builds the runtime and packs `release\X.Y.Z\`: the game folder, the zip players download,
+`update-X.Y.Z.zip` and `update.txt` for the Play screen's updater.
+
+The releases themselves are built by GitHub Actions: push a tag `vYYYY.MM.DD` (or run the workflow by hand and give it a
+version) and [.github/workflows/release.yml](.github/workflows/release.yml) fetches the pinned toolchain with
+`windows/get_tools.ps1`, runs `build.bat release` and publishes the three files as the release's assets. The tag and the
+version in the file names must match, because `update.txt` is what installed copies compare against.
+
 `build.bat release X.Y.Z` also packs a release folder in `release\`. It needs the pinned toolchain in `gcc\` and
 `python\` (both go into the release, so players need nothing installed) and `redist\zlib1.dll` and `redist\SDL2.dll`.
 
@@ -433,6 +500,10 @@ when `python.exe` on `PATH` isn't the one you want.
 - **AMD**: FidelityFX Super Resolution 1 (MIT); FidelityFX SDK 2.4.0 API headers (MIT) for FSR 3.1 frame
   generation, whose DLLs are downloaded from AMD at the player's request
 - **NVIDIA**: DLSS, downloaded from NVIDIA at the player's request (`nvngx_dlss.dll` is not part of the release)
+- **melos444**: the [Green Energy 10x](https://gamebanana.com/mods/734159) mod that the Gameplay option of that name is based on
+- **Gamerjin**, **Luffysan** and **ZiT866**: the [cheat research on GBAtemp](https://gbatemp.net/threads/metroid-prime-4-beyond-010019a01e2f2000.677778/) that the built-in cheats are based on
+- **PlagueDrRiess**: the depth-target readback work in the renderer (read back only the part a DMA copy needs, and the
+  scan visor's reticle depth straight from the scaled buffer), ported here from the Windows fork of this project
 - **Dear ImGui** (MIT), libvpx and OpenH264 (BSD), SDL2 and zlib (zlib licence)
 - **Claude** (Anthropic): AI pair programmer for this fork's changes
 - Program icon: [Metroid icon created by Smashicons - Flaticon](https://www.flaticon.com/free-icons/metroid)

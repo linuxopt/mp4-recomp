@@ -1,0 +1,59 @@
+# Builds the Windows game folder and publishes it as a GitHub release: push a tag vYYYY.MM.DD (or run it by hand with a
+# version). The release gets the zip players download, plus update-<version>.zip and update.txt for the Play screen's
+# in-place updates (runtime/beyond_ui/fe_update.cpp reads them from releases/latest).
+#
+# The workflow is PlagueDrRiess's (PlagueDrRiess/salsburysteaks), adapted to this fork's tree.
+name: Windows release
+
+on:
+  push:
+    tags: ['v*.*.*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version, YYYY.MM.DD (the release is tagged vYYYY.MM.DD)'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Version
+        shell: pwsh
+        run: |
+          $v = if ('${{ github.event_name }}' -eq 'push') { '${{ github.ref_name }}'.TrimStart('v') } else { '${{ inputs.version }}' }
+          if ($v -notmatch '^\d+\.\d+\.\d+$') { throw "version '$v' is not X.Y.Z" }
+          "VERSION=$v" >> $env:GITHUB_ENV
+
+      - name: Cache toolchain downloads
+        uses: actions/cache@v4
+        with:
+          path: _dl
+          key: tools-${{ hashFiles('windows/get_tools.ps1') }}
+
+      - name: Toolchain
+        shell: pwsh
+        run: ./windows/get_tools.ps1
+
+      - name: Build
+        shell: cmd
+        run: |
+          set GLSLANG=%GITHUB_WORKSPACE%\third_party\glslang\bin\glslang.exe
+          call build.bat release %VERSION%
+
+      # A release is published, never edited in place: what players already downloaded must keep working.
+      - name: Publish
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $d = "release/$env:VERSION"
+          gh release create "v$env:VERSION" `
+            "$d/MetroidPrime4Recomp-PC-v$env:VERSION.zip" "$d/update-$env:VERSION.zip" "$d/update.txt" `
+            --target "${{ github.sha }}" --title "Metroid Prime 4 Recomp v$env:VERSION (Windows)" `
+            --notes "Windows build. Download MetroidPrime4Recomp-PC-v$env:VERSION.zip, extract it, and run ``Metroid Prime 4 Beyond.exe``. You need your own dumped copy of the game and its update; see the README. What changed: see CHANGELOG.md. Found a problem? Use the bug report form under Issues and attach Metroid Prime 4 Beyond.log from the game folder."

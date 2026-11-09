@@ -2,10 +2,11 @@
 #pragma once
 #include <string>
 
-// this fork's GitHub repository (owner/name): the Play screen's updates and its bug report page. Set it to where you
-// publish the fork; until then update checks find nothing (SWR_UPDATE_REPO overrides it at run time)
+// this fork's GitHub repository (owner/name): the Play screen's updates and its bug report page. This fork publishes its
+// Windows releases here, so the updater reads this repository and not the upstream one (SWR_UPDATE_REPO overrides it at
+// run time). If this branch is ever merged upstream, this one line goes back to "linuxopt/mp4-recomp".
 #ifndef MP4_REPO
-#define MP4_REPO "linuxopt/mp4-recomp"
+#define MP4_REPO "Zorkats/mp4-recomp"
 #endif
 #include <vector>
 #include <map>
