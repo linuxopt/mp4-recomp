@@ -1,0 +1,242 @@
+{
+ "format": 2,
+ "files": {
+  "code_021.c": {
+   "pristine": "c5798033c0aeea906cb975f468d469fff5a211d5060ebc6bc44e0fb2542a2cde",
+   "result": "4b775ad8ab01417db3d3c835d956a9d48701a9a9f403d1ca17d5748e65809a9f",
+   "hunks": [
+    [
+     22058,
+     22058,
+     [
+      " c->rt->svc(c,0xFF85);"
+     ]
+    ]
+   ]
+  },
+  "code_022.c": {
+   "pristine": "a47ca6cbf39dcf2709c83269d84f7857ad6d6cdaf14aca24e3317cad9dac1fd6",
+   "result": "e8e069069795aa97ce08966aabe7a96f640025ac5e418180b9a3090f0ba0e845",
+   "hunks": [
+    [
+     16714,
+     16714,
+     [
+      " c->rt->svc(c,0xFF87);"
+     ]
+    ],
+    [
+     16925,
+     16925,
+     [
+      " c->rt->svc(c,0xFF86);"
+     ]
+    ]
+   ]
+  },
+  "code_029.c": {
+   "pristine": "032fffac359c5208ac2645e24e3f7a6796a4773451765d64922788e3fca8b8f4",
+   "result": "0cdf9cef1b18e13fd71f527f874c9c5e4fc71e330285158846bbe713ff6b9af4",
+   "hunks": [
+    [
+     27393,
+     27393,
+     [
+      " if(UNLIKELY(RD32(c->x[1])==0x1A035166u && (i32)(u32)c->x[9]>0)) c->rt->svc(c,0xFFE0);"
+     ]
+    ]
+   ]
+  },
+  "code_030.c": {
+   "pristine": "1f8ff97d6df5dc43822ca2a590da24d728397f24bcdc675094d67c65f9f7dacb",
+   "result": "a9815c4072f8da66ab3e9827990f603f5bcb6e8892fb27d46189daa556967498",
+   "hunks": [
+    [
+     22899,
+     22899,
+     [
+      " c->rt->svc(c,0xFF8B);"
+     ]
+    ]
+   ]
+  },
+  "code_044.c": {
+   "pristine": "c624f71bf666aab31699ba2abdbd8afb84671e3777eca05ac50697a44768e0dc",
+   "result": "71b7e673d523741933f5ee865a9cf8bb683012295c07adc9b7a784c6c0fc7ce9",
+   "hunks": [
+    [
+     27928,
+     27928,
+     [
+      " c->rt->svc(c,0xFF86);"
+     ]
+    ]
+   ]
+  },
+  "code_050.c": {
+   "pristine": "b1a80647f2b99de22107f2df3bf349c5cf2b338472dcb2a4b4786c79d616e68b",
+   "result": "f646df6b8d9a592ff1a20517b96daef769569ebd07a731d340e3aa0495293a25",
+   "hunks": [
+    [
+     9131,
+     9131,
+     [
+      " c->rt->svc(c,0xFF80);"
+     ]
+    ],
+    [
+     9137,
+     9137,
+     [
+      " c->rt->svc(c,0xFF81);"
+     ]
+    ],
+    [
+     9147,
+     9147,
+     [
+      " c->rt->svc(c,0xFF82);"
+     ]
+    ],
+    [
+     9185,
+     9185,
+     [
+      " c->rt->svc(c,0xFF84);"
+     ]
+    ]
+   ]
+  },
+  "code_059.c": {
+   "pristine": "196d261d5e85cb3b96229e74018157391fc83b7d97a0c7c77e3d397dd71813fa",
+   "result": "774bd8505820a33b0e1b153235fd4e26accbeef7762d8e81db34cc44d2240ba8",
+   "hunks": [
+    [
+     33273,
+     33273,
+     [
+      " c->rt->svc(c,0xFF87);"
+     ]
+    ]
+   ]
+  },
+  "code_086.c": {
+   "pristine": "12f222c042c81e0d9309f4a07ad26c2e266920190a4ce871da04d97336952095",
+   "result": "350d110396718ed4e8c04bbd68dec1c5e7e8ac6518ce4418bddd26c341deb44b",
+   "hunks": [
+    [
+     44138,
+     44138,
+     [
+      " c->rt->svc(c,0xFF83);"
+     ]
+    ]
+   ]
+  },
+  "code_106.c": {
+   "pristine": "4b3b7fdc6633565542b1b7cb5ed291fb7de7a0d2a001eb406e525fa8e4aed0a3",
+   "result": "e354e1b437153dc7861c797856d4bec5e9c904f0c6b34c409169e681e8545a35",
+   "hunks": [
+    [
+     2250,
+     2250,
+     [
+      " c->rt->svc(c,0xFF8A);"
+     ]
+    ]
+   ]
+  },
+  "code_110.c": {
+   "pristine": "7486d89f7cbf34913e8453a5bc92110b9025ffe607ceb734efa0224b0c480ab2",
+   "result": "04fdd70d44258b8b713880be68dc151fce3a049512f506a25d26cef3d2362444",
+   "hunks": [
+    [
+     8699,
+     8699,
+     [
+      " c->rt->svc(c,0xFF8C);"
+     ]
+    ]
+   ]
+  },
+  "code_129.c": {
+   "pristine": "08f0a8f374aadb0c8ee38c6911dceceaefd98e52a6410659a10271ea0d37957d",
+   "result": "e6742dcc37ce9a9ee4b82fa706d7bf8b411f45a3edd7a8ae6ece19a09e54e8dc",
+   "hunks": [
+    [
+     21893,
+     21893,
+     [
+      " c->rt->svc(c,0xFF89);"
+     ]
+    ]
+   ]
+  },
+  "code_137.c": {
+   "pristine": "108d10d1fd0254ee4143624cd27de6157bb2127bf273c8fae5bfec27f7d62bc0",
+   "result": "a80847d37678f5d68ad67eae5079ef65def35b600f7b1d212cd9f757c3d7a67b",
+   "hunks": [
+    [
+     36833,
+     36833,
+     [
+      " c->rt->svc(c,0xFF88);"
+     ]
+    ]
+   ]
+  },
+  "code_147.c": {
+   "pristine": "0ec383c6a488451c483c973568ca885ff2e85388dbca3d478e08f746bbb13567",
+   "result": "bf104a1437bfb1c66e97ae1abdfe4c2c28853c03201f91ee4e56d54563f03405",
+   "hunks": [
+    [
+     43739,
+     43739,
+     [
+      " c->rt->svc(c,0xFF8D);"
+     ]
+    ],
+    [
+     43745,
+     43745,
+     [
+      " c->rt->svc(c,0xFF90);"
+     ]
+    ],
+    [
+     43746,
+     43746,
+     [
+      " c->rt->svc(c,0xFF8F);"
+     ]
+    ]
+   ]
+  },
+  "code_148.c": {
+   "pristine": "5e9fe9423a76a5adfa9be7669acd35a2215308db0188c693f86912b6889210e7",
+   "result": "3039f3c0a2568e53decc6370211ef67794c0200168d666dbb4081b98faa02b93",
+   "hunks": [
+    [
+     2087,
+     2087,
+     [
+      " c->rt->svc(c,0xFF8F);"
+     ]
+    ]
+   ]
+  },
+  "code_158.c": {
+   "pristine": "7fdbc18a6c5c09f1e6839ed0abec820368c3e2b2d2bcc4e13bbc3b0d0994d113",
+   "result": "4829f95d96a7051da6eb4d74f69e1926715400df8750b4a44df7d102c4313eff",
+   "hunks": [
+    [
+     11543,
+     11543,
+     [
+      " c->rt->svc(c,0xFF8E);"
+     ]
+    ]
+   ]
+  }
+ }
+}

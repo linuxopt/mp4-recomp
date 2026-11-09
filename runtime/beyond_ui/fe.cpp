@@ -177,25 +177,45 @@ static void controller_status_card() {
 
 // ---------------------------------------------------------------- settings picked for this PC (Play screen AUTO-SET, Advanced,
 // and once after first-time setup when nothing was brought over from an older installation)
-struct Rec { float res = 1; std::string fps, af, asp, sharp, renderer, summary, note; };
+struct Rec { float res = 1; bool docked = true, dyn = false, aa = false; std::string fps, af, asp, sharp, renderer, summary, note, profile, dyn_min, upscaler; };
+// 0 low (integrated graphics, the Steam Deck), 1 medium, 2 high, 3 ultra. The graphics card sets the level; too little video
+// memory, main memory or CPU pulls it down, because those make the game stutter whatever the card can do
+static int hw_level() {
+    int l = g_hw.tier == "high" ? 2 : g_hw.tier == "mid" ? 1 : 0;
+    std::string u = g_hw.gpu; for (auto& c : u) c = (char)toupper((unsigned char)c);
+    bool top = false; for (const char* n : {"RTX 4080", "RTX 4090", "RTX 5070 TI", "RTX 5080", "RTX 5090", "RX 7900", "RX 9070", "RX 9080"}) top = top || u.find(n) != std::string::npos;
+    if (l == 2 && top && g_hw.cores >= 12 && g_hw.vram_mb >= 12000 && g_hw.ram_gb >= 16) l = 3;
+    if (g_hw.vram_mb && g_hw.vram_mb < 3500) l = 0; else if (g_hw.vram_mb && g_hw.vram_mb < 7500) l = std::min(l, 1);
+    if (l > 1 && g_hw.cores < 6) l--;   // a weak CPU or little memory: never down to Low, drawing fewer pixels would not help them
+    if (l > 1 && g_hw.ram_gb && g_hw.ram_gb < 12) l--;
+    return l;
+}
+// which PC the settings were picked for: not the screen, a laptop or a Deck on a dock is still the same PC
+static std::string hw_id() { return fmt("%s|%d|%d", g_hw.gpu.c_str(), g_hw.cores, g_hw.ram_gb); }
 static Rec recommend() {
     if (!g_hw_done) { g_hw = detect_hardware(); g_hw_done = true; }
     Rec r; float ratio = (float)g_hw.w / std::max(1, g_hw.h);
     r.asp = ratio >= 2.2f ? "21:9" : fabsf(ratio - 1.6f) < 0.02f ? "16:10" : "16:9";
-    float base = game_base_h(true, r.asp.c_str()), native = roundf(g_hw.h / base * 20) / 20;
-    r.res = 1.0f;   // the game's own resolution: above it costs GPU-thread time in busy areas (measured: 50 fps at 2x vs 60 at 1x)
-    r.fps = g_hw.hz >= 230 && g_hw.tier == "high" && g_hw.cores >= 8 ? "240" : g_hw.hz >= 140 && g_hw.tier != "low" ? "144" : g_hw.hz >= 115 && g_hw.tier != "low" ? "120" : "1";
-    r.af = g_hw.tier != "low" ? "16" : "4";
+    int lv = hw_level(); r.profile = lv == 3 ? "Ultra" : lv == 2 ? "High" : lv == 1 ? "Medium" : "Low";
+    r.docked = lv > 0;   // the console's handheld mode draws fewer pixels: what low-power graphics need
+    r.dyn = lv < 2; r.dyn_min = lv == 0 ? "0.6" : "0.75"; r.aa = lv > 0;
+    float base = game_base_h(r.docked, r.asp.c_str());
+    // the game's own resolution: above it costs GPU-thread time in busy areas (measured: 50 fps at 2x vs 60 at 1x).
+    // Ultra 1.5x: RX 9070 XT, Ice Belt lake fight replay, 60 FPS held with the same pacing as 1x (2026-11-08)
+    r.res = lv == 3 ? 1.5f : 1.0f; if (lv == 3) r.aa = false;
+    r.fps = "1";   // 60: the game's speed on a Switch. More is untested with this game (it can run too fast), so it is never picked for you
+    r.af = lv >= 2 ? "16" : lv == 1 ? "8" : "4";
     r.sharp = base * r.res < g_hw.h - 1 ? "25" : "0";   // the picture is stretched to the screen: a light sharpen
+    r.upscaler = r.sharp != "0" ? "fsr" : "bilinear";
     // renderer: above 60 FPS on a discrete NVIDIA / AMD card native Vulkan is clearly smoother (2026-10-23, RTX 5070, 240 cap:
     // seconds under 200 FPS 2 vs 33-35 with OpenGL, whose driver-call thread is the limit in heavy rooms). At 60 both hold 60, and
     // OpenGL is the most tested; integrated graphics stay on OpenGL (native Vulkan untested there). It falls back to OpenGL by itself.
     // 2026-10-23 owner: OpenGL stays the pick for now (native Vulkan is still experimental). When it becomes the default:
     //   r.renderer = !g_hw.integrated && (NVIDIA or AMD/Radeon in g_hw.gpu) && r.fps != "1" ? "vulkan_native" : "opengl";
     r.renderer = "opengl";
-    r.summary = fmt("Resolution %s, %s, picture %s, anisotropic filtering %s\xC3\x97%s, %s, fullscreen.",
-                    res_text(r.res, true, r.asp.c_str()).c_str(), r.fps == "1" ? "60 FPS" : (r.fps + " FPS").c_str(), r.asp.c_str(), r.af.c_str(),
-                    r.sharp != "0" ? ", light sharpening" : "", r.renderer == "vulkan_native" ? "Native Vulkan (smoothest at high frame rates)" : "OpenGL");
+    r.summary = fmt("%s profile: %s mode, resolution %s%s, %s, picture %s, anisotropic filtering %s\xC3\x97%s%s, %s, fullscreen.", r.profile.c_str(), r.docked ? "docked" : "handheld",
+                    res_text(r.res, r.docked, r.asp.c_str()).c_str(), r.dyn ? fmt(" (lowered down to %s\xC3\x97 in heavy scenes)", r.dyn_min.c_str()).c_str() : "", r.fps == "1" ? "60 FPS" : (r.fps + " FPS").c_str(), r.asp.c_str(), r.af.c_str(),
+                    r.sharp != "0" ? ", FSR with light sharpening" : "", r.aa ? ", anti-aliasing" : "", r.renderer == "vulkan_native" ? "Native Vulkan (smoothest at high frame rates)" : "OpenGL");
     if (g_hw.ram_gb && g_hw.ram_gb < 8) r.note = fmt("This PC has %d GB of memory; the game needs about 4 GB, so 8 GB is recommended. Close other programs before playing.", g_hw.ram_gb);
 #ifndef SWR_RELEASE   // the public release has no DLSS
     else if (g_hw.rtx) r.note = "Optional: Graphics > Native Vulkan + NVIDIA DLAA gives the cleanest edges on RTX cards (experimental renderer).";
@@ -203,7 +223,9 @@ static Rec recommend() {
     return r;
 }
 static void apply_rec(const Rec& r) {
-    set("docked", "1"); set("fullscreen", "1"); set("resolution", fmt("%g", r.res)); set("fps_limit", r.fps); set("renderer", r.renderer);
+    set("docked", r.docked ? "1" : "0"); set("fullscreen", "1"); set("resolution", fmt("%g", r.res)); set("fps_limit", r.fps); set("renderer", r.renderer);
+    set("dynamic_resolution", r.dyn ? "1" : "0"); if (r.dyn) set("dynamic_resolution_min", r.dyn_min);
+    set("antialiasing", r.aa ? "1" : "0"); set("upscaler", r.upscaler); set("auto_hw", hw_id());
     set("anisotropy", r.af); set("sharpening", r.sharp); set("sleep_waits", "1"); set("texture_threads", "0"); set("prebuild_shaders", "1");
     set("auto_set", "1");
 }
@@ -418,6 +440,10 @@ static void page_play() {
     {
         Rec r = recommend();
         row_text("Detected", hw_line().c_str());
+        // an install used from another PC (a shared home, a copied folder): offer to fit it. Nothing changes unless it is pressed
+        std::string was = g_ini.get("auto_hw", "");
+        if (was.empty() && g_ini.get("auto_set", "") == "1") set("auto_hw", hw_id());   // set up by a version that did not record the PC
+        else if (!was.empty() && was != hw_id() && row_button("##retune", fmt("These settings were picked for different hardware. Fit them to this PC? (%s)", r.profile.c_str()).c_str(), "FIT TO THIS PC", true)) { apply_rec(r); flash("Settings picked for this PC: " + r.summary); }
         if (row_button("##auto", "Not sure what to pick? Choose the best settings for this PC", "AUTO-SET", true)) { apply_rec(r); flash("Settings picked for this PC: " + r.summary); }
         help_text((r.summary + " Anything can still be changed afterwards.").c_str());
         if (!r.note.empty()) help_text(r.note.c_str());
@@ -492,7 +518,10 @@ static void page_gameplay() {
     section("FRAME RATE"); draw_opt("fps_limit"); draw_opt("forced_vsync"); draw_opt("show_fps");
     section("RIDES"); draw_opt("fast_forward"); if (getb("fast_forward")) draw_opt("fast_forward_speed");
     section("CAMERA"); draw_opt("fov");
-    section("CHEATS"); draw_opt("cheats");
+    section("CHEATS"); draw_opt("cheats"); draw_opt("green_energy_10x");
+    section("CHEATS: AMMO"); for (const char* k : {"cheat_missiles", "cheat_super_shot", "cheat_large_shot", "cheat_power_bombs", "cheat_ammo", "cheat_elemental_ammo", "cheat_arm_cannon", "cheat_crystals"}) draw_opt(k);
+    section("CHEATS: SAMUS"); for (const char* k : {"cheat_health", "cheat_jumps", "cheat_speed", "cheat_walls", "cheat_flare_timer"}) draw_opt(k);
+    section("CHEATS: COMBAT"); for (const char* k : {"cheat_one_hit", "cheat_two_hit", "cheat_ally_health", "cheat_ally_dying"}) draw_opt(k);
 }
 
 static void page_audio() {
@@ -638,8 +667,8 @@ static void page_advanced() {
     {
         Rec r = recommend();
         row_text("Detected", hw_line().c_str());
-        help_text((r.summary + (r.renderer == "vulkan_native" ? " Also: docked, shaders saved as you play, 60 FPS loading screens."
-                                                              : " Also: docked, shaders built before playing, 60 FPS loading screens.")).c_str());
+        help_text((r.summary + (r.renderer == "vulkan_native" ? " Also: shaders saved as you play, 60 FPS loading screens."
+                                                              : " Also: shaders built before playing, 60 FPS loading screens.")).c_str());
         if (row_button("##rec", "Apply the recommended settings", "APPLY", true)) { apply_rec(r); flash("Recommended settings applied"); }
         if (!r.note.empty()) help_text(r.note.c_str());
     }
@@ -831,7 +860,7 @@ static void test_tick() {
     if (getenv("SWR_FE_AUTOSET") && g_frame_no == 30) {   // presses AUTO-SET, writes what was detected and picked, then quits
         Rec r = recommend(); apply_rec(r); g_ini.save(); g_ini_dirty = false;
         const char* rp = getenv("SWR_FE_RESULT"); FILE* f = rp ? fopen(rp, "a") : nullptr;
-        if (f) { fprintf(f, "autoset tier=%s detected=%s | picked=%s | note=%s\n", g_hw.tier.c_str(), hw_line().c_str(), r.summary.c_str(), r.note.c_str()); fclose(f); }
+        if (f) { fprintf(f, "autoset tier=%s level=%d detected=%s | picked=%s | note=%s\n", g_hw.tier.c_str(), hw_level(), hw_line().c_str(), r.summary.c_str(), r.note.c_str()); fclose(f); }
         g_quit = true;
     }
     if (getenv("SWR_FE_REPORT") && g_frame_no == 30) {   // presses REPORT, writes the zip and the page it would open, then quits

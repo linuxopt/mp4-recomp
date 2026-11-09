@@ -21,8 +21,43 @@
 #define strncasecmp _strnicmp
 #endif
 
-int g_opt_cheats=1, g_opt_fov=100;
+int g_opt_cheats=1, g_opt_fov=100, g_opt_green10=0;
 extern u64 g_pad_buttons_now;   /* svc_hid.c: buttons as the game sees them this update */
+
+/* The instruction-patch cheats of the GBAtemp thread for this build (8275FBE1EC5191C2), rebuilt as hooks: a patch to ARM
+   code can't reach recompiled code, so beyond_patches.json adds c->rt->svc(c,0xFF80+id) right after each instruction those
+   cheats replace and this does what the replacement would have done, while its option ([Gameplay] cheat_*, live) is on.
+   By Gamerjin, Luffysan and others, with pointers by ZiT866. The hooks cost a call that returns at once when off. */
+#define NAT_N 17
+static const char* const nat_key[NAT_N]={"cheat_missiles","cheat_super_shot","cheat_large_shot","cheat_power_bombs","cheat_ammo","cheat_health",
+  "cheat_arm_cannon","cheat_elemental_ammo","cheat_speed","cheat_walls","cheat_flare_timer","cheat_crystals","cheat_jumps","cheat_ally_health",
+  "cheat_ally_dying","cheat_one_hit","cheat_two_hit"};
+static volatile int g_nat[NAT_N];
+int cheats_nat_opt(const char* k, const char* v){ for(int i=0;i<NAT_N;i++) if(!strcmp(k,nat_key[i])){ g_nat[i]=atoi(v)!=0; return 1; } return 0; }
+static inline void nat_s(CPU* c, int r, f32 v){ V128* p=&c->v[r]; p->d[0]=0; p->d[1]=0; p->f[0]=v; }
+static inline u32 nat_r32(u64 a){ u32 v; memcpy(&v,GP(a),4); return v; }
+static inline void nat_w32(u64 a, u32 v){ memcpy(GP(a),&v,4); }
+/* the guest instruction before each hook has just used these addresses, so they are mapped */
+void cheats_native(CPU* c, u32 id){
+  extern int g_opt_cheats;
+  if(id>=NAT_N || !g_nat[id] || !g_opt_cheats) return;
+  { static volatile int said[NAT_N]; if(!said[id]){ said[id]=1; LOG("cheats: %s is working\n",nat_key[id]); } }
+  switch(id){
+  case 0: case 1: case 2: case 3: c->x[2]=0; break;   /* the amount a shot uses */
+  case 4: nat_s(c,0,0); break;                        /* the amount any ammo changes by */
+  case 5: nat_w32(c->x[8],c->v[1].s[0]); break;       /* health = its maximum */
+  case 6: c->x[0]=1; break;                           /* "has this elemental shot" */
+  case 7: nat_s(c,1,20); break;                       /* the elemental ammo check reads 20 */
+  case 8: nat_s(c,0,(g_pad_buttons_now&2)? 200 : 100); break;   /* B = faster */
+  case 9: { f32 v= (g_pad_buttons_now&0x40)? -1.5f : 1.5f; nat_s(c,6,v); nat_w32(c->x[0]+60,c->v[6].s[0]); break; }   /* L = the other way */
+  case 10: { u16 h; memcpy(&h,GP(c->x[19]+141),2); if(h==561){ nat_s(c,2,0); nat_w32(c->x[19]+136,0); } break; }   /* only the Flare Pool countdown */
+  case 11: if(g_pad_buttons_now&0x100) c->x[9]=204; break;   /* while ZL is held */
+  case 12: c->x[0]=1; break;                          /* "can jump" */
+  case 13: nat_s(c,0,0); c->v[0].d[0]=nat_r32(c->x[0]+24); break;   /* reads the maximum, not the current health */
+  case 14: c->x[0]=0; break;                          /* "is dying" */
+  case 15: c->v[0].f[0]+=c->v[2].f[0]; c->v[0].s[1]=0; c->v[0].d[1]=0; break;   /* damage + current health */
+  case 16: { if(c->x[0]){ f32 h; u32 v=nat_r32(c->x[0]+28); memcpy(&h,&v,4); if(h>2.0f){ h=2.0f; memcpy(&v,&h,4); nat_w32(c->x[0]+28,v); } } break; }   /* health over 2 becomes 2 */
+  } }
 
 #define MAXC 256
 #define MAXW 4096

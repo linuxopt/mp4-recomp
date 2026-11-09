@@ -87,8 +87,17 @@ static int q_pop(Work* w, i64 timeout){
   *w=q[qt]; qt=(qt+1)%QN; pc_signal(&g_qspace); pm_unlock(&g_ql); return 1; }
 
 /* ============================================================ GL helpers */
+/* Every source goes to the driver with a comment unique to this compile. Mesa skips the GLSL compile of a source it has seen
+   before and expects the link to come from its disk cache; when that lookup misses, Mesa 26.2.6 links a shader with no IR and
+   crashes in link_intrastage_shaders (a read at address 8 on a compile thread, rarely, seconds into a new area). A source never
+   seen before always compiles, and the compiled-code cache under it is keyed by the shader, not this text, so it still hits.
+   Only what reaches the driver changes: Sh.src and the cache keys made from it don't */
+static void sh_source(GLuint sh, const char* src){
+  static u64 base; static volatile u64 count; if(!base) base=plat_ns();
+  char nonce[40]; snprintf(nonce,sizeof nonce,"\n// swr %016llx\n",(unsigned long long)(base^__atomic_add_fetch(&count,1,__ATOMIC_RELAXED)));
+  const char* parts[2]={src,nonce}; glShaderSource(sh,2,parts,NULL); }
 static GLuint compile(GLenum type, const char* src, char* err, int errn){
-  GLuint s=glCreateShader(type); glShaderSource(s,1,&src,NULL); glCompileShader(s); GLint ok=0; glGetShaderiv(s,GL_COMPILE_STATUS,&ok);
+  GLuint s=glCreateShader(type); sh_source(s,src); glCompileShader(s); GLint ok=0; glGetShaderiv(s,GL_COMPILE_STATUS,&ok);
   if(!ok){ if(err) glGetShaderInfoLog(s,errn,NULL,err); glDeleteShader(s); return 0; } return s; }
 
 static GLuint link2(GLuint a, GLuint b, GLuint c3){
@@ -162,7 +171,9 @@ static GlFmt tic_format(u32 w0, int srgb){
     case 0x42: r=FASTC(6,6); break; case 0x55: r=FASTC(8,5); break; case 0x52: r=FASTC(8,6); break; case 0x44: r=FASTC(8,8); break;
     case 0x56: r=FASTC(10,5); break; case 0x57: r=FASTC(10,6); break; case 0x53: r=FASTC(10,8); break; case 0x45: r=FASTC(10,10); break;
     case 0x54: r=FASTC(12,10); break; case 0x46: r=FASTC(12,12); break;
-    case 0x29: case 0x2A: case 0x2B: r= FD(GL_DEPTH24_STENCIL8,GL_DEPTH_STENCIL,GL_UNSIGNED_INT_24_8,4); break;
+    /* 0x0E G24R8: the same depth-stencil data with the stencil in red (a stencil read, tic_stencil_read). Unknown here, it
+       bound nothing and the fog pass got stencil 0 everywhere: the Ice Belt lake disappeared in fog */
+    case 0x0E: case 0x29: case 0x2A: case 0x2B: r= FD(GL_DEPTH24_STENCIL8,GL_DEPTH_STENCIL,GL_UNSIGNED_INT_24_8,4); break;
     case 0x2F: r= FD(GL_DEPTH_COMPONENT32F,GL_DEPTH_COMPONENT,GL_FLOAT,4); break;
     case 0x30: r= FD(GL_DEPTH32F_STENCIL8,GL_DEPTH_STENCIL,GL_FLOAT_32_UNSIGNED_INT_24_8_REV,8); break;   /* ZF32_X24S8 */
     case 0x3A: r= FD(GL_DEPTH_COMPONENT16,GL_DEPTH_COMPONENT,GL_UNSIGNED_SHORT,2); break;
@@ -496,18 +507,19 @@ static void tex_upload_(Tex* t){ if(!g_upl_t0) g_upl_t0=plat_ns(); st_tex_up+=t-
       else { for(u32 y=0;y<th;y++) memcpy(lin+(u64)y*rowb,src+(u64)y*t->pitch,rowb); }
       upload_unpack_ns+=plat_ns()-upload_stage; upload_stage=plat_ns();
       const u8* up=lin; u8* dec=NULL;
-      if((f->astc||f->dec) && !(dec=upload_buffer(&upload_decoded,(u64)lw*lh*4+64))){ upload_release(&upload_linear,lin); if(!direct) upload_release(&upload_source,src); off+= t->bl? lsz : (u64)t->pitch*th; continue; }
+      /* ld is 1 unless this is a 3D texture: every slice is decoded and uploaded, not only the first (the rest used to come from past the end of the buffer, so the fog noise of the Ice Belt lake was garbage) */
+      if((f->astc||f->dec) && !(dec=upload_buffer(&upload_decoded,(u64)lw*lh*ld*4+64))){ upload_release(&upload_linear,lin); if(!direct) upload_release(&upload_source,src); off+= t->bl? lsz : (u64)t->pitch*th; continue; }
       if((f->astc && t->target==GL_TEXTURE_2D && layers==1 && l+1<t->levels && a_async==(int)l && (u64)lw*lh>128u*128u && aj_on()) || (int)l<a_arr){
         aj_push(t,l,layer,lw,lh,f->bw,f->bh,lin,(size_t)rowb*th); if(!a_arr) a_async++;
         upload_release(&upload_decoded,dec); upload_release(&upload_linear,lin); if(!direct) upload_release(&upload_source,src); off+= t->bl? lsz : (u64)t->pitch*th; continue; }
-      if(f->astc){ astc_decode_par(lin,lw,lh,f->bw,f->bh,dec); up=dec; }
-      else if(f->dec){ u32* o=(u32*)dec;
-        if(f->dec<10){ swr_bc_decode(f->dec,lin,lw,lh,o); }
-        else { const u16* q=(const u16*)lin; for(u32 y=0;y<lh;y++) for(u32 x=0;x<lw;x++){ u32 v=q[(size_t)y*(rowb/2)+x], rr,gg,bb,aa;
+      if(f->astc){ for(u32 z=0;z<ld;z++) astc_decode_par(lin+(u64)z*rowb*th,lw,lh,f->bw,f->bh,dec+(u64)z*lw*lh*4); up=dec; }
+      else if(f->dec){ for(u32 z=0;z<ld;z++){ u32* o=(u32*)dec+(u64)z*lw*lh; const u8* sl=lin+(u64)z*rowb*th;
+        if(f->dec<10){ swr_bc_decode(f->dec,sl,lw,lh,o); }
+        else { const u16* q=(const u16*)sl; for(u32 y=0;y<lh;y++) for(u32 x=0;x<lw;x++){ u32 v=q[(size_t)y*(rowb/2)+x], rr,gg,bb,aa;
             if(f->dec==10){ rr=(v&15)*17; gg=((v>>4)&15)*17; bb=((v>>8)&15)*17; aa=((v>>12)&15)*17; }
             else if(f->dec==11){ rr=(v&31)*255/31; gg=((v>>5)&31)*255/31; bb=((v>>10)&31)*255/31; aa=(v>>15)? 255 : 0; }
             else { rr=(v&31)*255/31; gg=((v>>5)&63)*255/63; bb=((v>>11)&31)*255/31; aa=255; }
-            o[(size_t)y*lw+x]=rr|(gg<<8)|(bb<<16)|(aa<<24); } }
+            o[(size_t)y*lw+x]=rr|(gg<<8)|(bb<<16)|(aa<<24); } } }
         up=dec; }
       upload_decode_ns+=plat_ns()-upload_stage;
       { static int dmp=-1, nd; if(dmp<0) dmp=getenv("SWR_DUMP_TEX")!=NULL;
@@ -1304,7 +1316,7 @@ static void pack_add(u64 key, Sh* vs, Sh* fs);
 static void pack_add_sh(u64 key, Sh* s);
 
 static int sh_start(Sh* s){ if(s->gl) return 1; if(s->failed || !s->src) return 0;
-  s->gl=glCreateShader(s->stage==ST_VS? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER); const char* src=s->src; glShaderSource(s->gl,1,&src,NULL); glCompileShader(s->gl); return 1; }
+  s->gl=glCreateShader(s->stage==ST_VS? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER); const char* src=s->src; sh_source(s->gl,src); glCompileShader(s->gl); return 1; }
 static GLuint prog_finish(Sh* vs, Sh* fs, GLuint p);
 static u64 prog_key(Sh* vs, Sh* fs);
 static int prog_cached(Sh* vs, Sh* fs);
@@ -1371,7 +1383,7 @@ static void shader_worker(void* arg){ plat_diag_role("shader-worker");
     u64 tc0=plat_ns();
     if(j->try_bin){GLuint p=binary_load(j->bin_path,j->sep);if(p){glFinish();j->prog=p;__atomic_store_n(&j->state,1,__ATOMIC_RELEASE);continue;}}
     GLuint a=glCreateShader(j->sep? j->stype : GL_VERTEX_SHADER), b= j->sep? 0 : glCreateShader(GL_FRAGMENT_SHADER);
-    const char* s1=j->vs; const char* s2=j->fs; glShaderSource(a,1,&s1,NULL); glCompileShader(a); if(b){ glShaderSource(b,1,&s2,NULL); glCompileShader(b); }
+    const char* s1=j->vs; const char* s2=j->fs; sh_source(a,s1); glCompileShader(a); if(b){ sh_source(b,s2); glCompileShader(b); }
     GLuint p=glCreateProgram(); glAttachShader(p,a); if(b) glAttachShader(p,b);
     if(j->sep) p_glProgramParameteri(p,0x8258 /* GL_PROGRAM_SEPARABLE */,GL_TRUE);
     if(g_pcache>0) p_glProgramParameteri(p,GL_PROGRAM_BINARY_RETRIEVABLE_HINT,GL_TRUE);
@@ -1453,7 +1465,7 @@ static int sh_sep_ready(Sh* s){
   if(g_worker==1 && !g_sync_draws && wr_push(&wq_hi,j)){ s->sj=j; s->sps=1; return 0; }
   /* no compile thread, do it inline */
   u64 inline_start=plat_ns();
-  GLuint a=glCreateShader(j->stype); const char* s1=s->src; glShaderSource(a,1,&s1,NULL); glCompileShader(a);
+  GLuint a=glCreateShader(j->stype); const char* s1=s->src; sh_source(a,s1); glCompileShader(a);
   GLuint p=glCreateProgram(); glAttachShader(p,a); p_glProgramParameteri(p,0x8258,GL_TRUE); if(g_pcache>0) p_glProgramParameteri(p,GL_PROGRAM_BINARY_RETRIEVABLE_HINT,GL_TRUE);
   glLinkProgram(p); glDeleteShader(a); GLint ok=0; glGetProgramiv(p,GL_LINK_STATUS,&ok);
   if(!ok){ glGetProgramInfoLog(p,sizeof j->log,NULL,j->log); WARN("shader %016llx failed to compile: %s\n",(unsigned long long)s->hash,j->log); glDeleteProgram(p); p=0; }
@@ -3691,8 +3703,8 @@ static void warm_step(void){
     glDeleteProgram(wj[j].p); glDeleteShader(wj[j].a); glDeleteShader(wj[j].b); wj[j]=wj[--wj_n]; wq_done++;
     if(wq_done==wq_n) LOG("shaders: precompiled pack (%u programs)\n",wq_n); }
   while(wj_n<4 && wq_i<wq_n){ PackEnt* e=&wq[wq_i++]; if(e->sep){ free(e->vs); e->vs=NULL; wq_done++; continue; } WarmJob* j=&wj[wj_n++]; j->key=e->key;
-    j->a=glCreateShader(GL_VERTEX_SHADER); const char* s1=e->vs; glShaderSource(j->a,1,&s1,NULL); glCompileShader(j->a);
-    j->b=glCreateShader(GL_FRAGMENT_SHADER); const char* s2=e->fs; glShaderSource(j->b,1,&s2,NULL); glCompileShader(j->b);
+    j->a=glCreateShader(GL_VERTEX_SHADER); const char* s1=e->vs; sh_source(j->a,s1); glCompileShader(j->a);
+    j->b=glCreateShader(GL_FRAGMENT_SHADER); const char* s2=e->fs; sh_source(j->b,s2); glCompileShader(j->b);
     j->p=glCreateProgram(); glAttachShader(j->p,j->a); glAttachShader(j->p,j->b); p_glProgramParameteri(j->p,GL_PROGRAM_BINARY_RETRIEVABLE_HINT,GL_TRUE); glLinkProgram(j->p);
     free(e->vs); free(e->fs); e->vs=e->fs=NULL; } }
 /* ============================================================ shader pre-build (ini prebuild_shaders=1)
@@ -3771,7 +3783,7 @@ static void prebuild_shaders(void){
       FILE* t=fopen(bp,"rb");
       if(t){ fclose(t); had++; }
       else { u64 c0=plat_ns();
-        GLuint a=glCreateShader(stage==ST_VS? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER); const char* s1=src; glShaderSource(a,1,&s1,NULL); glCompileShader(a);
+        GLuint a=glCreateShader(stage==ST_VS? GL_VERTEX_SHADER : GL_FRAGMENT_SHADER); const char* s1=src; sh_source(a,s1); glCompileShader(a);
         GLuint p=glCreateProgram(); glAttachShader(p,a); p_glProgramParameteri(p,0x8258,GL_TRUE); p_glProgramParameteri(p,GL_PROGRAM_BINARY_RETRIEVABLE_HINT,GL_TRUE);
         glLinkProgram(p); glDeleteShader(a); GLint ok=0; glGetProgramiv(p,GL_LINK_STATUS,&ok);
         if(ok){ binary_save(p,key,1); built++;

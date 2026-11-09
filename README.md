@@ -360,6 +360,8 @@ the AppImage instead: `bash linux/setup_game.sh GAME_FOLDER [UPDATE_FOLDER]`, th
 - **ScarletNX**: the native Vulkan renderer (GPL-3.0)
 - **AMD**: FidelityFX Super Resolution 1 (MIT)
 - **Dear ImGui** (MIT), libvpx and OpenH264 (BSD), SDL2 and zlib (zlib licence)
+- **melos444**: the [Green Energy 10x](https://gamebanana.com/mods/734159) mod that the Gameplay option of that name is based on
+- **Gamerjin**, **Luffysan** and **ZiT866**: the [cheat research on GBAtemp](https://gbatemp.net/threads/metroid-prime-4-beyond-010019a01e2f2000.677778/) that the built-in cheats are based on
 - **Claude** (Anthropic): AI pair programmer for this fork's changes
 - Program icon: [Metroid icon created by Smashicons - Flaticon](https://www.flaticon.com/free-icons/metroid)
 

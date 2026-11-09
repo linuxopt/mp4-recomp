@@ -521,6 +521,24 @@ static std::vector<Opt> build_options() {
     B("show_fps", "Graphics", "Gameplay", "FPS counter", LIVE_YES, "0", "Shows the frames per second that reach the screen, in the top-left corner.");
     I("fov", "Gameplay", "Gameplay", "Field of view", LIVE_YES, "100", 60, 160, 5, "Percent of the game's own field of view. Needs a FOV hook for your game build (beyond/fov_hooks.txt).");
     B("cheats", "Gameplay", "Gameplay", "Cheat codes", LIVE_YES, "1", "Runs the cheats you turn on in the Cheats page (Atmosphere format files in the game's cheats folder).");
+    B("green_energy_10x", "Gameplay", "Gameplay", "Green Energy 10x", LIVE_YES, "0", "Less crystal grinding: Green Energy awards are worth 10 times as much (1 / 3 / 6 become 10 / 30 / 60). Energy you already have is not changed, and what you collect stays if you turn this off. After the mod by melos444 on GameBanana.");
+    B("cheat_missiles", "Gameplay", "Gameplay", "Missiles don't decrease", LIVE_YES, "0", "Firing missiles doesn't use any. Not while using the Legacy Suit's missile shield.");
+    B("cheat_super_shot", "Gameplay", "Gameplay", "Super shots don't decrease", LIVE_YES, "0", "Super shots don't use ammo.");
+    B("cheat_large_shot", "Gameplay", "Gameplay", "Large shots don't decrease", LIVE_YES, "0", "Large shots don't use ammo.");
+    B("cheat_power_bombs", "Gameplay", "Gameplay", "Power Bombs don't decrease", LIVE_YES, "0", "Power Bombs don't get used up.");
+    B("cheat_ammo", "Gameplay", "Gameplay", "Ammo and bike boost don't decrease", LIVE_YES, "0", "Nothing that counts as ammo goes down, bike boost included.");
+    B("cheat_health", "Gameplay", "Gameplay", "Infinite health", LIVE_YES, "0", "Health is put back to its maximum. Big hits can still get through.");
+    B("cheat_arm_cannon", "Gameplay", "Gameplay", "Any elemental shot", LIVE_YES, "0", "Switch to any elemental shot, even before you find it.");
+    B("cheat_elemental_ammo", "Gameplay", "Gameplay", "Infinite elemental ammo", LIVE_YES, "0", "Elemental shots always have ammo, even with none.");
+    B("cheat_speed", "Gameplay", "Gameplay", "Speed booster (hold B: faster)", LIVE_YES, "0", "Moves Samus at a set high speed; hold B for double. Turn it off if it gets in the way.");
+    B("cheat_walls", "Gameplay", "Gameplay", "Walk through walls (hold L: reverse)", LIVE_YES, "0", "Changes how Samus collides so she can pass walls; hold L for the other way. You can get stuck: keep a save.");
+    B("cheat_flare_timer", "Gameplay", "Gameplay", "Freeze the Flare Pool timer", LIVE_YES, "0", "Stops the escape countdown after the Flare Pool boss.");
+    B("cheat_crystals", "Gameplay", "Gameplay", "More green crystals (hold ZL)", LIVE_YES, "0", "Hold ZL as you deposit green crystals to reach the most in one go. Collect at least one first.");
+    B("cheat_jumps", "Gameplay", "Gameplay", "Infinite jumps", LIVE_YES, "0", "Jump again as many times as you like in mid-air.");
+    B("cheat_ally_health", "Gameplay", "Gameplay", "Allies at full health", LIVE_YES, "0", "Allies always read as fully healthy.");
+    B("cheat_ally_dying", "Gameplay", "Gameplay", "Allies can't go down", LIVE_YES, "0", "Allies stop at a quarter of their health instead of going down. Not confirmed on GBAtemp.");
+    B("cheat_one_hit", "Gameplay", "Gameplay", "One-hit kills", LIVE_YES, "0", "Any hit kills, bosses included.");
+    B("cheat_two_hit", "Gameplay", "Gameplay", "Two-hit kills (not bosses)", LIVE_YES, "0", "Enemies drop to at most 2 health when hit. Bosses are left alone.");
     B("fast_forward", "Performance", "Gameplay", "Fast-forward toggle (Tab or L3+R3)", LIVE_YES, "0", "For elevator and train rides. Don't leave it on during play.");
     I("fast_forward_speed", "Performance", "Gameplay", "Fast-forward speed", LIVE_YES, "3", 2, 8, 1, "");
     // Audio

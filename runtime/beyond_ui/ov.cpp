@@ -123,7 +123,9 @@ void tab_content(int t) {
             section("CAMERA"); opt_row("fov"); if (!fov_available()) help_text("No FOV hook for this game build yet: the slider has no effect until one is added to beyond/fov_hooks.txt.");
             section("RIDES"); opt_row("fast_forward"); if (val("fast_forward") == "1") opt_row("fast_forward_speed"); break;
     case 3: {
-        section("CHEATS"); opt_row("cheats");
+        section("CHEATS"); opt_row("cheats"); opt_row("green_energy_10x");
+        section("BUILT-IN CHEATS"); for (const char* k : {"cheat_missiles", "cheat_super_shot", "cheat_large_shot", "cheat_power_bombs", "cheat_ammo", "cheat_elemental_ammo", "cheat_arm_cannon", "cheat_crystals", "cheat_health", "cheat_jumps", "cheat_speed", "cheat_walls", "cheat_flare_timer", "cheat_one_hit", "cheat_two_hit", "cheat_ally_health", "cheat_ally_dying"}) opt_row(k);
+        section("CHEAT FILE");
         int n = cheats_count();
         if (!n) help_text(fmt("No cheats for this game build. Put an Atmosphere cheat file at %s and press Reload.", cheats_path()).c_str());
         for (int i = 0; i < n; i++) {

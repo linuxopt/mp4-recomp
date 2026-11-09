@@ -6,6 +6,9 @@
    loop (window, input, vsync). */
 #include "rt.h"
 #include <sys/stat.h>
+#ifndef _WIN32
+#include <dlfcn.h>   /* crash_report: which library crashed */
+#endif
 
 const SwrModule* g_mod;
 GuestFn* g_disp;
@@ -232,6 +235,12 @@ void crash_report(void* host_pc, void* fault, int sig){
       else { extern int plat_module_of(const void*, char*, int, u64*); char mn[260]; u64 mo=0;
         if(plat_module_of(host_pc,mn,sizeof mn,&mo)) logf_(0,"  in %s (+%llx), a thread %s\n",mn,(unsigned long long)mo, kthread_cur()? "of the game" : "of the runtime (GPU, audio, video or window): a graphics driver's DLL here points at the driver");
         else logf_(0,"  in no loaded module, a thread %s\n", kthread_cur()? "of the game" : "of the runtime"); } }
+#else
+    { /* which library and function: the runtime, a graphics driver, the game code */
+      Dl_info di; memset(&di,0,sizeof di);
+      if(dladdr(host_pc,&di) && di.dli_fname) logf_(0,"  in %s (+%llx)%s%s, a thread %s\n",di.dli_fname,(unsigned long long)((u8*)host_pc-(u8*)di.dli_fbase),di.dli_sname? " near " : "",di.dli_sname? di.dli_sname : "",
+                                                kthread_cur()? "of the game" : "of the runtime (GPU, audio, video or window)");
+      else logf_(0,"  in no loaded library, a thread %s\n",kthread_cur()? "of the game" : "of the runtime"); }
 #endif
     if(ga && ga<0x1000000ull) logf_(0,"  the address is a null pointer plus an offset: the game probably got NULL from its allocator (out of memory?). Try memory_gb=6 in the .ini\n"); }
   if(g_mod){ /* closest recompiled fn below host pc */
@@ -309,6 +318,8 @@ static void ini_apply(const char* k, const char* v){
     else if(!strcmp(k,"sharpening")){ extern int g_opt_sharp; g_opt_sharp=atoi(v); if(g_opt_sharp<0) g_opt_sharp=0; if(g_opt_sharp>100) g_opt_sharp=100; }   /* gpu_gl.c present pass, snxvk hdr.c */   /* FXAA: gpu_gl.c present pass, snxvk hdr.c */
     else if(!strcmp(k,"show_fps")) g_opt_show_fps=atoi(v)!=0;   /* FPS counter, live */
     else if(!strcmp(k,"cheats")){ extern int g_opt_cheats; g_opt_cheats=atoi(v)!=0; }   /* cheats.c, live */
+    else if(!strncmp(k,"cheat_",6)){ extern int cheats_nat_opt(const char*,const char*); cheats_nat_opt(k,v); }   /* cheats.c, live */
+    else if(!strcmp(k,"green_energy_10x")){ extern int g_opt_green10; g_opt_green10=atoi(v)!=0; }   /* kernel.c swr_svc, live */
     else if(!strcmp(k,"fov")){ extern int g_opt_fov; g_opt_fov=atoi(v); if(g_opt_fov<60) g_opt_fov=60; if(g_opt_fov>160) g_opt_fov=160; }   /* cheats.c FOV hook, live */
     else if(!strcmp(k,"anisotropy")){ g_opt_aniso=atoi(v); if(g_opt_aniso<0) g_opt_aniso=0; if(g_opt_aniso>16) g_opt_aniso=16; }
     else if(!strcmp(k,"dlss")){ extern int snxvk_dlss_mode; snxvk_dlss_mode=atoi(v); }   /* native Vulkan: snxvk dlss.c; OpenGL: dlss_gl.c + gpu_gl.c dlg_* */
@@ -359,6 +370,24 @@ static const IniOpt INI_GRAPHICS[]={
   {NULL,NULL,NULL}};
 static const IniOpt INI_PERF[]={
   {"audio_surround_downmix","1","1 = mix all six audio channels into the stereo output, as the console does (0 = front left/right only: no center channel, so no dialogue)"},
+  {"cheat_missiles","0","1 = cheat: Missiles don't decrease (a hook of the GBAtemp code for this game build)"},
+  {"cheat_super_shot","0","1 = cheat: Super shots don't decrease (a hook of the GBAtemp code for this game build)"},
+  {"cheat_large_shot","0","1 = cheat: Large shots don't decrease (a hook of the GBAtemp code for this game build)"},
+  {"cheat_power_bombs","0","1 = cheat: Power Bombs don't decrease (a hook of the GBAtemp code for this game build)"},
+  {"cheat_ammo","0","1 = cheat: Ammo and bike boost don't decrease (a hook of the GBAtemp code for this game build)"},
+  {"cheat_health","0","1 = cheat: Infinite health (a hook of the GBAtemp code for this game build)"},
+  {"cheat_arm_cannon","0","1 = cheat: Use any elemental shot, even ones you lack (a hook of the GBAtemp code for this game build)"},
+  {"cheat_elemental_ammo","0","1 = cheat: Infinite elemental ammo (a hook of the GBAtemp code for this game build)"},
+  {"cheat_speed","0","1 = cheat: Speed booster (hold B to go faster) (a hook of the GBAtemp code for this game build)"},
+  {"cheat_walls","0","1 = cheat: Walk through walls (hold L for the other way) (a hook of the GBAtemp code for this game build)"},
+  {"cheat_flare_timer","0","1 = cheat: Freeze the Flare Pool escape timer (a hook of the GBAtemp code for this game build)"},
+  {"cheat_crystals","0","1 = cheat: More green crystals (hold ZL while depositing) (a hook of the GBAtemp code for this game build)"},
+  {"cheat_jumps","0","1 = cheat: Infinite jumps (a hook of the GBAtemp code for this game build)"},
+  {"cheat_ally_health","0","1 = cheat: Allies at full health (a hook of the GBAtemp code for this game build)"},
+  {"cheat_ally_dying","0","1 = cheat: Allies can't go down (a hook of the GBAtemp code for this game build)"},
+  {"cheat_one_hit","0","1 = cheat: One-hit kills, bosses too (a hook of the GBAtemp code for this game build)"},
+  {"cheat_two_hit","0","1 = cheat: Two-hit kills, not bosses (a hook of the GBAtemp code for this game build)"},
+  {"green_energy_10x","0","1 = Green Energy awards are worth 10 times as much (after the mod by melos444)"},
   {"cheats","1","1 = run the cheat codes that are on (Atmosphere format, <game>_data/cheats/<build id>.txt; turn them\n;   on and off in the in-game menu, Cheats page)"},
   {"fov","100","Field of view in percent of the game's own (60-160, applies live). Needs a FOV hook for this game\n;   build (beyond/fov_hooks.txt)"},
   {"fps_limit","1","1 = 60 FPS (the speed of a Switch), 0 = unlimited (the game runs faster). Values under 60 are treated as 60: the game advances one step per image, so 30 meant half speed. F4 changes it in game"},
