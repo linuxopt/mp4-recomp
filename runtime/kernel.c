@@ -717,6 +717,12 @@ static void trace_main_call(KThread*t,CPU*c,u32 svc,u64 caller,u64 start,u64 obj
   u64 fp=c->x[29];for(int k=0;k<8&&fp;k++){MemBlock b;mem_query(fp,&b);if(!(b.perm&PERM_R)||fp<b.addr||fp+16>b.addr+b.size)break;u64 next=gr64(fp),ret=gr64(fp+8);LOG("main stall: stack[%d]=%llx\n",k,(unsigned long long)ret);if(next<=fp)break;fp=next;}
 }
 void swr_svc(CPU* c, u32 imm){
+  /* not a system call: the Green Energy 10x option (beyond_patches.json adds this call where an award's amount becomes s0;
+     after the mod by melos444 on GameBanana, whose cheat form can't work on recompiled code). Saturates like the mod */
+  /* not a system call either: a cheat rebuilt as a hook (cheats.c, beyond_patches.json) */
+  if(imm>=0xFF80 && imm<=0xFF90){ extern void cheats_native(CPU*,u32); cheats_native(c,imm-0xFF80); return; }
+  if(imm==0xFFE0){ extern int g_opt_green10; if(g_opt_green10){ long long v=(long long)(int)(u32)c->x[9]*10; if(v>0x7FFFFFFFll) v=0x7FFFFFFFll;
+      V128* p=&c->v[0]; p->d[0]=0; p->d[1]=0; p->f[0]=(f32)(int)v; static int said; if(said<8){ said++; LOG("mods: Green Energy award %d -> %lld\n",(int)(u32)c->x[9],v); } } return; }
   u64 a0=c->x[0],a1=c->x[1],a2=c->x[2];
   u64 a3=c->x[3];
   KThread* ct=c->thread;
