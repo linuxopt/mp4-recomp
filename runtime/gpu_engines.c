@@ -288,7 +288,10 @@ void dma_method(GpuChannel* ch, u32 m, u32 v){
       src_linear?"lin":"bl",dst_linear?"lin":"bl",(unsigned long long)src,(unsigned long long)dst,pitch_in,pitch_out,line_len,lines,multi,remap,r[0x1C2],dbh,dw,dh,r[0x1C6],r[0x1C7],r[0x1C8],sbh,sw,sh,r[0x1CF],v); } }
   extern int g_gl; extern void gpu_gl_rt_flush(u64); extern void gpu_gl_rt_reload(u64); extern void gpu_gl_trace(const char*);
   if(g_gl){ char tb[256]; snprintf(tb,sizeof tb,"DMA %s %llx -> %s %llx len=%u lines=%u remap=%d\n",src_linear?"lin":"bl",(unsigned long long)src,dst_linear?"lin":"bl",(unsigned long long)dst,line_len,lines,remap); gpu_gl_trace(tb);
-    { extern u64 plat_ns(void); u64 t0=plat_ns(); extern void gpu_gl_rt_flush_read(u64); if(src!=dst) gpu_gl_rt_flush_read(src); else gpu_gl_rt_flush(src); u64 t1=plat_ns(); gpu_gl_rt_flush(dst); u64 t2=plat_ns();
+    { extern u64 plat_ns(void); u64 t0=plat_ns(); extern void gpu_gl_rt_flush_read(u64);
+      /* the part of a block-linear source this copy reads, so a depth target needn't come back whole */
+      extern u32 g_dma_rect[5]; if(!src_linear && !sz_ && !r[0x1CE] && r[0x1CD]<=1){ g_dma_rect[0]=sx*(remap?bpp:1); g_dma_rect[1]=sy; g_dma_rect[2]=line_len; g_dma_rect[3]=lines; g_dma_rect[4]=sw*(remap?bpp:1); }
+      if(src!=dst) gpu_gl_rt_flush_read(src); else gpu_gl_rt_flush(src); g_dma_rect[2]=0; u64 t1=plat_ns(); gpu_gl_rt_flush(dst); u64 t2=plat_ns();
       if(t2-t0>10000000ull){ static int said; if(said<30){ said++; LOG("dma: flush src %.1f ms dst %.1f ms (%s %llx -> %s %llx, len %u lines %u, src %ux%u)\n",(t1-t0)/1e6,(t2-t1)/1e6,src_linear?"lin":"bl",(unsigned long long)src,dst_linear?"lin":"bl",(unsigned long long)dst,line_len,lines,sw,sh); } } } }
   u8* dpp=NULL; u8* spp=NULL; u64 dspan=0, sspan=0; (void)spp; (void)sspan;
   if(remap && (r[0x1C2]&7)==4 && dst_linear){
