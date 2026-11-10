@@ -91,15 +91,52 @@ static void ctr_xor(const Aes* a, u64 hi, u64 blk, u8* buf, size_t nblk){
 typedef struct { char name[48]; u8 v[32]; int n; } Key;
 static Key g_keys[512]; static int g_nkeys;
 static void keys_load(const char* path, int must){ FILE* f=fopen(path,"r"); if(!f){ if(must) nx_fail("Cannot open the keys file %s.",path); return; }
-  char l[512]; while(fgets(l,sizeof l,f) && g_nkeys<512){ char* e=strchr(l,'='); if(!e) continue; *e=0; char* k=l; while(isspace((u8)*k)) k++;
+  char l[512]; while(fgets(l,sizeof l,f) && g_nkeys<512){ char* e=strchr(l,'='); if(!e) continue; *e=0; char* k=l; if(!memcmp(k,"\xEF\xBB\xBF",3)) k+=3; while(isspace((u8)*k)) k++;
     char* ke=e; while(ke>k && isspace((u8)ke[-1])) ke--; *ke=0; char* v=e+1; while(isspace((u8)*v)) v++;
     Key* K=&g_keys[g_nkeys]; snprintf(K->name,sizeof K->name,"%s",k); for(char* c=K->name;*c;c++) *c=(char)tolower((u8)*c); K->n=0;
     while(K->n<32 && isxdigit((u8)v[0]) && isxdigit((u8)v[1])){ unsigned x; sscanf(v,"%2x",&x); K->v[K->n++]=(u8)x; v+=2; }
     if(K->n==16 || K->n==32) g_nkeys++; }
   fclose(f); }
 static const u8* key_get(const char* name, int len){ for(int i=0;i<g_nkeys;i++) if(g_keys[i].n==len && !strcmp(g_keys[i].name,name)) return g_keys[i].v; return NULL; }
-static const u8* key_need(const char* name, int len){ const u8* k=key_get(name,len);
-  if(!k) nx_fail("The keys file has no %s. Dump the keys from your own Switch again (Lockpick_RCM): a newer game needs newer keys.",name); return k; }
+/* the firmware that brought master key XX: a keys file dumped on older firmware has no master_key_XX */
+static const char* key_fw(int idx){ static const char* fw[]={"1.0.0","3.0.0","3.0.1","4.0.0","5.0.0","6.0.0","6.2.0","7.0.0","8.1.0","9.0.0","9.1.0",
+  "12.1.0","13.0.0","14.0.0","15.0.0","16.0.0","17.0.0","18.0.0","19.0.0","20.0.0","21.0.0"};  /* newer ones: not listed yet */
+  return idx>=0 && idx<(int)(sizeof fw/sizeof *fw)? fw[idx] : NULL; }
+static const u8* key_add(const char* name, const u8 v[16]){ if(g_nkeys>=512) return NULL; Key* K=&g_keys[g_nkeys++];
+  snprintf(K->name,sizeof K->name,"%s",name); memcpy(K->v,v,16); K->n=16; return K->v; }
+/* titlekek_XX and key_area_key_application_XX come from master_key_XX and the fixed *_source keys (as Lockpick_RCM and
+   hactool derive them). Some keys files list only the master keys, so a missing one is derived here when it can be */
+static int key_calc(const char* name, u8 d[16], char b[48]){ int idx; Aes k;
+  if(sscanf(name,"titlekek_%x",&idx)==1){ snprintf(b,48,"master_key_%02x",idx); const u8 *mk=key_get(b,16), *src=key_get("titlekek_source",16);
+    if(!mk || !src) return 0; aes_key(&k,mk); aes_dec(&k,src,d); }
+  else if(sscanf(name,"key_area_key_application_%x",&idx)==1){ snprintf(b,48,"master_key_%02x",idx);
+    const u8 *mk=key_get(b,16), *kek=key_get("aes_kek_generation_source",16), *kg=key_get("aes_key_generation_source",16), *src=key_get("key_area_key_application_source",16);
+    if(!mk || !kek || !kg || !src) return 0; u8 t[16];
+    aes_key(&k,mk); aes_dec(&k,kek,t); aes_key(&k,t); aes_dec(&k,src,t); aes_key(&k,t); aes_dec(&k,kg,d); }
+  else return 0;
+  return 1; }
+static const u8* key_derive(const char* name){ u8 d[16]; char b[48]; if(!key_calc(name,d,b)) return NULL;
+  printf("note: the keys file has no %s; derived it from %s\n",name,b); fflush(stdout); return key_add(name,d); }
+/* --check-keys: every titlekek / key area key the file lists, against the one derived from its master key (names only) */
+static int keys_check(void){ int ok=0, bad=0, top=-1; char nm[48], b[48]; u8 d[16];
+  for(int i=0;i<0x20;i++){ snprintf(nm,sizeof nm,"master_key_%02x",i); if(key_get(nm,16)) top=i;
+    for(int j=0;j<2;j++){ snprintf(nm,sizeof nm,j? "key_area_key_application_%02x" : "titlekek_%02x",i); const u8* have=key_get(nm,16);
+      int can=key_calc(nm,d,b);
+      if(have && can){ int m=!memcmp(have,d,16); m? ok++ : bad++; printf("%s: %s\n",nm,m? "matches its master key" : "DOES NOT match its master key"); }
+      else if(!have && can) printf("%s: missing, derived from %s\n",nm,b);
+      else if(have) printf("%s: listed (no master key to check it against)\n",nm); } }
+  printf("newest master key: %s%02x (firmware %s)\n%d match, %d do not\n",top<0? "none " : "master_key_",top<0? 0 : top,key_fw(top)? key_fw(top) : "newer than 21.0.0",ok,bad);
+  return bad? 1 : 0; }
+static const u8* key_need(const char* name, int len){ const u8* k=key_get(name,len); if(!k && len==16) k=key_derive(name);
+  if(k) return k;
+  int idx=-1; const char* u=strrchr(name,'_'); if(u && (!strncmp(name,"titlekek_",9) || !strncmp(name,"key_area_key_application_",25))) idx=(int)strtol(u+1,NULL,16);
+  char mk[48]; snprintf(mk,sizeof mk,"master_key_%02x",idx);
+  if(idx>=0 && !key_get(mk,16)){ const char* fw=key_fw(idx);
+    nx_fail("The keys file has no %s (nor %s): it was dumped on firmware older than %s, and this game needs keys from %s or newer. "
+            "Update your Switch, then dump the keys again with the newest Lockpick_RCM and use that prod.keys.",name,mk,fw? fw : "the game needs",fw? fw : "newer firmware"); }
+  if(idx>=0) nx_fail("The keys file has no %s, and it can't be worked out because the file also lacks titlekek_source / aes_kek_generation_source / "
+                     "aes_key_generation_source / key_area_key_application_source. Dump the keys again from your own Switch with Lockpick_RCM: it writes all of them.",name);
+  nx_fail("The keys file has no %s. Dump the keys from your own Switch again (Lockpick_RCM): a newer game needs newer keys.",name); return NULL; }
 
 /* ---------------------------------------------------------------- file regions, PFS0 / HFS0 */
 typedef struct { FILE* f; u64 off, size; } Reg;
@@ -264,6 +301,7 @@ static int find_ncas(const Reg* r, Nca* out, int max){ Entry e[256]; int n=fs0_l
 
 int nx_extract_main(int argc, char** argv){
   const char *keys=NULL, *tkeys=NULL, *out=NULL, *file=NULL, *basef=NULL; u64 want=0;
+  for(int i=1;i<argc;i++) if(!strcmp(argv[i],"--check-keys") && i+1<argc){ keys_load(argv[i+1],1); return keys_check(); }
   for(int i=1;i<argc;i++){ if(!strcmp(argv[i],"--keys") && i+1<argc) keys=argv[++i]; else if(!strcmp(argv[i],"--title-keys") && i+1<argc) tkeys=argv[++i];
     else if(!strcmp(argv[i],"--out") && i+1<argc) out=argv[++i]; else if(!strcmp(argv[i],"--base") && i+1<argc) basef=argv[++i]; else if(!strcmp(argv[i],"--program") && i+1<argc) want=strtoull(argv[++i],NULL,16);
     else if(argv[i][0]!='-') file=argv[i]; }

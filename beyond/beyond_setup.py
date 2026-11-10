@@ -60,6 +60,23 @@ def key_candidates():
     return dirs
 
 
+def keys_newest(path):
+    """the highest master_key_XX a keys file lists (only the names are read), -1 for none"""
+    top = -1
+    try:
+        with open(path, 'r', errors='replace') as f:
+            for ln in f:
+                k = ln.partition('=')[0].strip().lstrip('\ufeff').lower()
+                if k.startswith('master_key_') and '=' in ln:
+                    try:
+                        top = max(top, int(k[11:], 16))
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return top
+
+
 def find_keys(given):
     """the player's prod.keys (and title.keys beside it, if any): --keys, SWR_KEYS, else where emulators keep them"""
     for p in (given, os.environ.get('SWR_KEYS', '')):
@@ -68,9 +85,14 @@ def find_keys(given):
             if not os.path.isfile(p):
                 raise Fail('The keys file does not exist: %s' % p)
             return p
-    for d in key_candidates():
-        if os.path.isfile(os.path.join(d, 'prod.keys')):
-            return os.path.join(d, 'prod.keys')
+    # several copies (an old ~/.switch one and a newer one an emulator keeps): the one from the newest firmware, as a newer
+    # game needs its master key; the first found on a tie
+    found = [os.path.join(d, 'prod.keys') for d in key_candidates() if os.path.isfile(os.path.join(d, 'prod.keys'))]
+    if found:
+        best = max(found, key=lambda p: (keys_newest(p), -found.index(p)))
+        if len(found) > 1:
+            log('Keys files found: %s; using %s (the newest master key)' % (', '.join('%s (master_key_%02x)' % (p, keys_newest(p)) for p in found), best))
+        return best
     raise Fail('Your Switch keys (prod.keys) were not found. A .xci or .nsp is encrypted: dump the keys from your own Switch '
                '(Lockpick_RCM) and put prod.keys in %s. Or extract the game with an emulator and choose the folder instead.'
                % key_candidates()[0])
