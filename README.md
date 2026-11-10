@@ -393,3 +393,5 @@ Apache-2.0; Apache-2.0 and MIT code is GPL-3.0-compatible). The licence texts ar
 
 *Metroid Prime 4: Beyond* is © Nintendo. This project is not affiliated with or endorsed by
 Nintendo.
+
+[![Listed on PlayPorted](https://playported.com/badge.svg)](https://playported.com/ports/1366-metroid-prime-4-beyond/)
