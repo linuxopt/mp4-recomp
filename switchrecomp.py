@@ -303,7 +303,9 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     oh = os.path.join(RT, 'oh264', 'win' if target_win else 'lin')
     h264 = os.path.isfile(os.path.join(oh, 'libdecoder.a')) and backend in ('win32', 'x11', 'headless')
     vp = os.path.join(RT, 'vp9', 'win' if target_win else 'lin')   # libvpx (VP9 .webm videos); optional
-    vp9 = os.path.isfile(os.path.join(vp, 'libvpx.a')) and backend in ('win32', 'x11', 'headless')
+    vp9_static = os.path.isfile(os.path.join(vp, 'libvpx.a')) and backend in ('win32', 'x11', 'headless')
+    vp9_sys = (not vp9_static) and (not target_win) and backend in ('x11', 'headless') and os.system('pkg-config --exists vpx >/dev/null 2>&1') == 0
+    vp9 = vp9_static or vp9_sys
     srcs += [os.path.join(RT, 'host1x.c'), os.path.join(RT, 'snxvk_glue.c')]
     # Metroid Prime 4 Beyond front end + in-game menu (Dear ImGui, runtime/beyond_ui); prebuilt by work-profiler/build_imgui.py
     imgui = os.path.join(RT, 'imgui', 'libimgui.a')
@@ -336,7 +338,8 @@ def build_runtime(cc, out, target_win, backend, say, opt='2'):
     if overlay and lx_frontend: cmd += ['-DSWR_HAVE_FRONTEND']
     if spvc: cmd += [spvc]
     if h264: cmd += [os.path.join(oh, 'libdecoder.a'), os.path.join(oh, 'libcommon.a')]
-    if vp9: cmd += [os.path.join(vp, 'libvpx.a')]
+    if vp9_static: cmd += [os.path.join(vp, 'libvpx.a')]
+    elif vp9_sys: cmd += ['-lvpx']
     if spvc or h264 or snxvk or frontend or overlay:
         # static on Linux too, so the runtime doesn't depend on the libstdc++ version of the distro
         cmd += ['-lstdc++'] if target_win else ['-Wl,-Bstatic', '-lstdc++', '-Wl,-Bdynamic', '-static-libgcc']

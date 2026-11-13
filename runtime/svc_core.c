@@ -10,7 +10,7 @@ u8* kshmem_ptr(KShmem* s);
 /* The language the game is given: one it has. A Switch never hands a game a language it doesn't list; it picks
    the nearest it has. Portuguese (9, pt-BR 17) gets English (US): a game
    without it loses its text and button glyphs, and Metroid Prime 4's language list is not known here */
-static int game_lang(void){ extern int g_opt_lang; int l=g_opt_lang; return l==9 || l==17? 1 : l; }
+static int game_lang(void){ extern int g_opt_lang; return g_opt_lang; }
 /* ================================================================ sm */
 static int sm_disp(SvcObj* o, IpcCtx* c){
   switch(c->cmd){
@@ -124,8 +124,8 @@ static int am_appfn(SvcObj* o, IpcCtx* c){         /* IApplicationFunctions */
       return RC(128,2); }
     case 10: out_obj(c,am_storage_new(in64(c,0),NULL)); return 0;
     case 20: out64(c,0); return 0;                                     /* EnsureSaveData */
-    case 21: { const char* l[]={"ja","en-US","fr","de","it","es","zh-CN","ko","nl","pt","ru","zh-TW","en-GB","fr-CA","es-419"};
-      u64 v=0; const char* s=l[game_lang()%15]; memcpy(&v,s,strlen(s)); out64(c,v); return 0; }
+    case 21: { const char* l[]={"ja","en-US","fr","de","it","es","zh-CN","ko","nl","pt","ru","zh-TW","en-GB","fr-CA","es-419","zh-Hans","zh-Hant","pt-BR"};
+      u64 v=0; const char* s=l[game_lang()%18]; memcpy(&v,s,strlen(s)); out64(c,v); return 0; }
     case 25: out64(c,0); return 0;                                     /* ExtendSaveData */
     case 26: out64(c,0x4000000); out64(c,0x4000000); return 0;       /* GetSaveDataSize */
     case 110: out32(c,0); return 0;
@@ -198,10 +198,10 @@ static int set_disp(SvcObj* o, IpcCtx* c){
   static const char* codes[]={"ja","en-US","fr","de","it","es","zh-CN","ko","nl","pt","ru","zh-TW","en-GB","fr-CA","es-419","zh-Hans","zh-Hant","pt-BR"};
   switch(c->cmd){
     case 0: { u64 v=0; const char* s=codes[game_lang()%18]; memcpy(&v,s,strlen(s)); out64(c,v); return 0; }     /* GetLanguageCode */
-    case 1: case 5: { u64 a,s; buf_out(c,0,&a,&s); u32 n=(u32)(s/8); u32 max= c->cmd==1? 15 : 18; if(n>max) n=max;
+    case 1: case 5: { u64 a,s; buf_out(c,0,&a,&s); u32 n=(u32)(s/8); u32 max=18; if(n>max) n=max;
       for(u32 i=0;i<n;i++){ u64 v=0; memcpy(&v,codes[i],strlen(codes[i])); gw64(a+i*8,v); } out32(c,n); return 0; }
     case 2: { u32 idx=in32(c,0); u64 v=0; if(idx<18) memcpy(&v,codes[idx],strlen(codes[idx])); out64(c,v); return 0; }   /* MakeLanguageCode */
-    case 3: out32(c,15); return 0;
+    case 3: out32(c,18); return 0;
     case 6: out32(c,18); return 0;
     case 4: out32(c,1); return 0;                     /* GetRegionCode: usa */
     case 7: case 9: { u64 a,s; buf_out(c,0,&a,&s); memset(GP(a),0,s); return 0; }
