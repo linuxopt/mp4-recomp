@@ -486,8 +486,8 @@ static std::vector<Opt> build_options() {
     B("docked", "Display", "Display", "Docked (TV) mode", LIVE_RESTART, "1", "Docked: the game renders 1600\xC3\x97" "900. Handheld: 1280\xC3\x97" "720.");
     B("fullscreen", "Display", "Display", "Fullscreen", LIVE_YES, "1", "F11 or Alt+Enter also switches it.");
     C("language", "Display", "Display", "Language", LIVE_RESTART, "1", {{"0", "Japanese"}, {"1", "English (US)"}, {"2", "French"}, {"3", "German"},
-      {"4", "Italian"}, {"5", "Spanish"}, {"6", "Chinese"}, {"7", "Korean"}, {"8", "Dutch"}, {"10", "Russian"},
-      {"11", "Taiwanese"}, {"12", "English (UK)"}, {"13", "French (Canada)"}, {"14", "Spanish (Latin America)"}}, "");
+      {"4", "Italian"}, {"5", "Spanish"}, {"6", "Chinese"}, {"7", "Korean"}, {"8", "Dutch"}, {"9", "Portuguese"}, {"10", "Russian"},
+      {"11", "Taiwanese"}, {"12", "English (UK)"}, {"13", "French (Canada)"}, {"14", "Spanish (Latin America)"}, {"17", "Portuguese (Brazil)"}}, "");
     // Graphics
     F("resolution", "Graphics", "Graphics", "Internal resolution", LIVE_GL, "1", 0.25f, 4.0f, 0.05f,
       "The game's 3D resolution. Above your screen's size it is averaged down (smoother edges, no shimmer).");
