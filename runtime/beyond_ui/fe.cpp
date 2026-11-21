@@ -19,6 +19,7 @@
 #include <dlfcn.h>
 #include <time.h>
 #include <unistd.h>
+#include <csignal>
 #endif
 #include <cstdio>
 #include <cmath>
@@ -1076,6 +1077,55 @@ static void fe_prepare() {
 } // namespace fe
 
 using namespace fe;
+
+// ---------------------------------------------------------------- --prepare: setup with no window (RecompLauncher)
+// "--prepare --base GAME [--update UPDATE] [--keys prod.keys]" (or --base=GAME ...): the Play screen's setup, run by a launcher
+// (recomplauncher.json prepare) that shows the progress itself. Prints "progress <0-1> <text>" lines, exits 0 when the game is
+// built, 2 when setup stopped (the reason on the last line and in setup.log), 3 for wrong arguments, 130 when stopped.
+// With the game data already installed (a rebuild after an update) it rebuilds from that, as REBUILD on the Play screen does,
+// so the player's files are not unpacked again
+#ifndef _WIN32
+static volatile sig_atomic_t g_prep_stop;
+static void prep_signal(int) { g_prep_stop = 1; }
+#endif
+extern "C" int fe_prepare_cli(int argc, char** argv, const char* exedir, const char* exename) {
+    P.init(exedir, exename);
+    SetupJob j;
+    for (int i = 2; i < argc; i++) {
+        std::string a = argv[i];
+        for (const char* k : {"--base", "--update", "--keys"}) {
+            std::string v; size_t n = strlen(k);
+            if (a == k && i + 1 < argc) v = argv[++i];
+            else if (a.compare(0, n + 1, std::string(k) + "=") == 0) v = a.substr(n + 1);
+            else continue;
+            (k[2] == 'b' ? j.base : k[2] == 'u' ? j.update : j.keys) = v; break;
+        }
+    }
+    if (check_installed().data_ok) { j.base = P.data; j.update.clear(); j.keys.clear(); printf("progress 0 Rebuilding from the installed game files\n"); }
+    else if (j.base.empty()) { printf("Setup needs your game: --prepare --base <your .xci / .nsp or extracted folder> [--update <the update .nsp>] [--keys <prod.keys>]\n"); return 3; }
+#ifndef _WIN32
+    signal(SIGTERM, prep_signal); signal(SIGINT, prep_signal); signal(SIGHUP, prep_signal);
+#endif
+    if (!setup_start(j)) { printf("%s\n", j.error.c_str()); fflush(stdout); return 2; }
+    std::string last; bool stopping = false;
+    for (;;) {
+        setup_lock(); float pct = j.pct; std::string stage = j.stage, msg = j.message; bool running = j.running; setup_unlock();
+        std::string line = fmt("progress %.3f %s%s%s", std::max(0.0f, std::min(1.0f, pct / 100.0f)), stage.c_str(), msg.empty() ? "" : ": ", msg.c_str());
+        if (line != last) { printf("%s\n", line.c_str()); fflush(stdout); last = line; }
+        if (!running) break;
+#ifndef _WIN32
+        if (g_prep_stop && !stopping) { stopping = true; setup_cancel(j); }   // python and every gcc it started (their own process group)
+        usleep(250000);
+#else
+        Sleep(250);   // a launcher that ends this process closes the setup's job object, which ends python and gcc too
+#endif
+    }
+    if (j.cancelled || stopping) { printf("Setup stopped: it continues where it was the next time\n"); fflush(stdout); return 130; }
+    if (j.failed || !j.done) { printf("%s\n", j.error.empty() ? "Setup stopped (see setup.log in the game folder)" : j.error.c_str()); fflush(stdout); return 2; }
+    update_setup_done();
+    printf("progress 1 Done\n"); fflush(stdout);
+    return 0;
+}
 
 // ---------------------------------------------------------------- entry points (backend_win32.c)
 #ifdef _WIN32

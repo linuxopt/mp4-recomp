@@ -285,6 +285,7 @@ bool setup_start(SetupJob& j) {
     if (py == "python3" && !on_path("python3")) { j.failed = true; j.error = "Python 3 was not found: install python3, or use the AppImage (it brings its own)."; return false; }
     std::vector<std::string> argv = {py, "-I", "-u", script, "--out", P.exedir, "--name", P.exename, "--base", j.base};
     if (!j.update.empty()) { argv.push_back("--update"); argv.push_back(j.update); }
+    if (!j.keys.empty()) { argv.push_back("--keys"); argv.push_back(j.keys); }
     int fd[2]; if (pipe(fd)) return false;
     j.log.clear(); j.error.clear(); j.pct = 0; j.done = j.failed = j.cancelled = false; j.running = true; j.stage = "Starting"; j.message = "";
     { FILE* f = fopen(join(P.exedir, "setup.log").c_str(), "ab"); if (f) { fprintf(f, "\n===== setup %s =====\n", now_stamp().c_str()); fclose(f); } }

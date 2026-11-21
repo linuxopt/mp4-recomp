@@ -60,6 +60,7 @@ GameCheck check_installed();
 // ---------------------------------------------------------------- setup (compile) child process
 struct SetupJob {
     std::string base, update;                 // folders chosen by the player
+    std::string keys;                         // the player's prod.keys (--prepare --keys); empty: setup looks where emulators keep it
     bool import_from_old = false; std::string old_exe;
     // progress, written by the reader thread
     volatile float pct = 0; volatile bool running = false, done = false, failed = false, cancelled = false;

@@ -861,6 +861,14 @@ int swr_main(int argc, char** argv){
 #if defined(SWR_HAVE_FRONTEND)
   { /* Play screen / first-run setup in the game window (beyond_ui/fe.cpp; on Linux its own window); returns 0 = start the game, 1 = quit */
     extern int backend_frontend(int argc, char** argv, const char* exedir, const char* exename);
+    /* --prepare: setup with no window, for a launcher (fe.cpp fe_prepare_cli, recomplauncher.json) */
+    if(argc>1 && !strcmp(argv[1],"--prepare")){ extern int fe_prepare_cli(int argc, char** argv, const char* exedir, const char* exename);
+      int rc=fe_prepare_cli(argc,argv,g_exedir,g_exename); fflush(NULL);
+#ifdef _WIN32
+      TerminateProcess(GetCurrentProcess(),(UINT)rc); }
+#else
+      _exit(rc); }
+#endif
 #ifdef _WIN32
     if(!g_xs && backend_frontend(argc,argv,g_exedir,g_exename)){ log_flush(); fflush(NULL); TerminateProcess(GetCurrentProcess(),0); } }
 #else

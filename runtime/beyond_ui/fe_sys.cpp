@@ -217,6 +217,7 @@ bool setup_start(SetupJob& j) {
     auto q = [](const std::string& v) { std::wstring w = wide(v); size_t n = 0; while (n < w.size() && w[w.size() - 1 - n] == L'\\') n++; w.append(n, L'\\'); return L"\"" + w + L"\""; };
     std::wstring cmd = q(py) + L" -I -u " + q(script) + L" --out " + q(P.exedir) + L" --name " + q(P.exename) + L" --base " + q(j.base);
     if (!j.update.empty()) cmd += L" --update " + q(j.update);
+    if (!j.keys.empty()) cmd += L" --keys " + q(j.keys);
     SECURITY_ATTRIBUTES sa = {sizeof sa, nullptr, TRUE}; HANDLE rd, wr;
     if (!CreatePipe(&rd, &wr, &sa, 0)) return false; SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
     STARTUPINFOW si = {sizeof si}; si.dwFlags = STARTF_USESTDHANDLES; si.hStdOutput = wr; si.hStdError = wr; si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
