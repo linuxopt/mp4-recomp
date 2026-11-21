@@ -1,0 +1,288 @@
+{
+  "$schema": "https://recomplauncher.com/schema/recomplauncher.json",
+  "format": 1,
+  "name": "Metroid Prime 4 Recomp",
+  "repo": "linuxopt/mp4-recomp",
+  "inputs": [
+    {
+      "id": "base",
+      "label": "Your Metroid Prime 4: Beyond for Switch (010019A01E2F2000): the game as .xci (cartridge) or .nsp (eShop), or a folder with its ExeFS and RomFS extracted with the 1.1.0 update applied.",
+      "role": "game",
+      "formats": [
+        { "type": "file", "extensions": ["xci", "nsp"], "requires": ["keys"] },
+        { "type": "folder" }
+      ]
+    },
+    {
+      "id": "update",
+      "label": "The game's 1.1.0 update (.nsp). Needed with a .xci or .nsp game; skip it for an extracted folder that already has the update.",
+      "role": "update",
+      "optional": true,
+      "formats": [
+        { "type": "file", "extensions": ["nsp"], "requires": ["keys"] }
+      ]
+    },
+    {
+      "id": "keys",
+      "label": "The prod.keys from your own Switch (Lockpick_RCM), to decrypt your .xci and .nsp files.",
+      "role": "key",
+      "shared": "switch.prod-keys"
+    },
+    {
+      "id": "dlss",
+      "label": "NVIDIA DLSS (DLAA anti-aliasing, Graphics > DLSS)",
+      "role": "runtime",
+      "shared": "nvidia.dlss",
+      "optional": true,
+      "destination": "nvngx_dlss.dll"
+    }
+  ],
+  "start": {
+    "program": ["Metroid Prime 4 Beyond.exe", "Metroid_Prime_4_Recomp-x86_64.AppImage"],
+    "args": ["--play"],
+    "env": { "MP4_RECOMP_HOME": "{install}" }
+  },
+  "prepare": {
+    "program": ["Metroid Prime 4 Beyond.exe", "Metroid_Prime_4_Recomp-x86_64.AppImage"],
+    "args": ["--prepare", "--base={input:base}", "--update={input:update}", "--keys={input:keys}"],
+    "env": { "MP4_RECOMP_HOME": "{install}" },
+    "label": "Building the game from your copy: unpacking it, translating the game code and compiling it (about 30 GB)",
+    "timeout": 14400,
+    "done": ["{install}/Metroid Prime 4 Beyond_data/setup.ok"],
+    "version": "RECOMPILER_ID"
+  },
+  "config": [
+    {
+      "format": "ini",
+      "file": [{ "path": "{install}/Metroid Prime 4 Beyond.ini" }],
+      "always": { "Launcher/check_updates": "0" }
+    }
+  ],
+  "saves": ["{install}/Metroid Prime 4 Beyond_data/save"],
+  "folders": {
+    "saves": [{ "path": "{install}/Metroid Prime 4 Beyond_data/save" }],
+    "logs": [{ "path": "{install}" }],
+    "mods": [{ "path": "{install}/Metroid Prime 4 Beyond_data/mods" }]
+  },
+  "actions": [
+    { "id": "open_mods", "label": "Open the mods folder", "help": "LayeredFS mods, one folder each.", "open": "mods" }
+  ],
+  "system": {
+    "windows": { "version": "10", "graphics": { "opengl": "4.3" } },
+    "linux": { "glibc": "2.35", "graphics": { "opengl": "4.3" } }
+  },
+  "groups": [{ "id": "Advanced", "advanced": true }],
+  "settings": [
+    {
+      "id": "fullscreen", "label": "Window Mode", "group": "Display",
+      "choices": [
+        { "label": "Fullscreen", "set": { "Display/fullscreen": "1" } },
+        { "label": "Window", "set": { "Display/fullscreen": "0" } }
+      ],
+      "defaults": { "Display/fullscreen": "1" }
+    },
+    {
+      "id": "docked", "label": "Console Mode", "group": "Display",
+      "help": "TV mode draws at 1920x1080 like a docked Switch, handheld mode at 1280x720. Applies on the next start.",
+      "choices": [
+        { "label": "Handheld", "set": { "Display/docked": "0" } },
+        { "label": "TV", "set": { "Display/docked": "1" } }
+      ],
+      "defaults": { "Display/docked": "0" }
+    },
+    {
+      "id": "language", "label": "Language", "group": "Display",
+      "choices": [
+        { "label": "English (US)", "set": { "Display/language": "1" } },
+        { "label": "English (UK)", "set": { "Display/language": "12" } },
+        { "label": "French", "set": { "Display/language": "2" } },
+        { "label": "French (Canada)", "set": { "Display/language": "13" } },
+        { "label": "German", "set": { "Display/language": "3" } },
+        { "label": "Italian", "set": { "Display/language": "4" } },
+        { "label": "Spanish", "set": { "Display/language": "5" } },
+        { "label": "Spanish (Latin America)", "set": { "Display/language": "14" } },
+        { "label": "Dutch", "set": { "Display/language": "8" } },
+        { "label": "Portuguese (Brazil)", "set": { "Display/language": "17" } },
+        { "label": "Russian", "set": { "Display/language": "10" } },
+        { "label": "Japanese", "set": { "Display/language": "0" } },
+        { "label": "Chinese", "set": { "Display/language": "6" } },
+        { "label": "Taiwanese", "set": { "Display/language": "11" } },
+        { "label": "Korean", "set": { "Display/language": "7" } }
+      ],
+      "defaults": { "Display/language": "1" }
+    },
+    {
+      "id": "resolution", "label": "Resolution", "group": "Graphics",
+      "help": "The 3D picture's resolution compared with the console's. Above native looks sharper and needs a faster graphics card.",
+      "choices": [
+        { "label": "Half (fastest)", "set": { "Graphics/resolution": "0.5" } },
+        { "label": "0.75x", "set": { "Graphics/resolution": "0.75" } },
+        { "label": "Native", "set": { "Graphics/resolution": "1" } },
+        { "label": "1.5x", "set": { "Graphics/resolution": "1.5" } },
+        { "label": "2x", "set": { "Graphics/resolution": "2" } },
+        { "label": "3x", "set": { "Graphics/resolution": "3" } }
+      ],
+      "defaults": { "Graphics/resolution": "1" }
+    },
+    {
+      "id": "upscaler", "label": "Upscaling", "group": "Graphics",
+      "help": "How a picture smaller than the window is enlarged. FSR 1 is sharper; pair it with a resolution below native.",
+      "choices": [
+        { "label": "Bilinear", "set": { "Graphics/upscaler": "bilinear" } },
+        { "label": "AMD FSR 1", "set": { "Graphics/upscaler": "fsr" } }
+      ],
+      "defaults": { "Graphics/upscaler": "bilinear" }
+    },
+    {
+      "id": "antialiasing", "label": "Anti-Aliasing", "group": "Graphics",
+      "help": "Smooths jagged edges. Not needed above native resolution.",
+      "choices": [
+        { "label": "Off", "set": { "Graphics/antialiasing": "0" } },
+        { "label": "FXAA", "set": { "Graphics/antialiasing": "1" } }
+      ],
+      "defaults": { "Graphics/antialiasing": "0" }
+    },
+    {
+      "id": "dlss", "label": "NVIDIA DLAA", "group": "Graphics",
+      "help": "DLSS anti-aliasing with the game's own motion vectors. Needs an RTX card and the DLSS download (Windows).",
+      "choices": [
+        { "label": "Off", "set": { "Graphics/dlss": "0" } },
+        { "label": "On", "set": { "Graphics/dlss": "1" } }
+      ],
+      "defaults": { "Graphics/dlss": "0" }
+    },
+    {
+      "id": "anisotropy", "label": "Texture Filtering", "group": "Graphics",
+      "help": "Sharper floors and walls seen at an angle. Applies on the next start.",
+      "choices": [
+        { "label": "As the game asks", "set": { "Graphics/anisotropy": "0" } },
+        { "label": "4x", "set": { "Graphics/anisotropy": "4" } },
+        { "label": "8x", "set": { "Graphics/anisotropy": "8" } },
+        { "label": "16x", "set": { "Graphics/anisotropy": "16" } }
+      ],
+      "defaults": { "Graphics/anisotropy": "0" }
+    },
+    {
+      "id": "shadows", "label": "Shadows", "group": "Graphics",
+      "choices": [
+        { "label": "On", "set": { "Graphics/shadows": "1" } },
+        { "label": "Off (faster)", "set": { "Graphics/shadows": "0" } }
+      ],
+      "defaults": { "Graphics/shadows": "1" }
+    },
+    {
+      "id": "fps_limit", "label": "Frame Rate", "group": "Performance",
+      "help": "60 is the Switch's own rate. The game keeps its real speed at higher rates.",
+      "choices": [
+        { "label": "60 (console)", "set": { "Performance/fps_limit": "1" } },
+        { "label": "120", "set": { "Performance/fps_limit": "120" } },
+        { "label": "144", "set": { "Performance/fps_limit": "144" } },
+        { "label": "165", "set": { "Performance/fps_limit": "165" } },
+        { "label": "240", "set": { "Performance/fps_limit": "240" } },
+        { "label": "Unlimited", "set": { "Performance/fps_limit": "0" } }
+      ],
+      "defaults": { "Performance/fps_limit": "1" }
+    },
+    {
+      "id": "show_fps", "label": "FPS Counter", "group": "Performance",
+      "choices": [
+        { "label": "Off", "set": { "Graphics/show_fps": "0" } },
+        { "label": "On", "set": { "Graphics/show_fps": "1" } }
+      ],
+      "defaults": { "Graphics/show_fps": "0" }
+    },
+    {
+      "id": "wait_for_shaders", "label": "New Shaders", "group": "Performance",
+      "help": "Waiting draws everything, with a short stutter the first time; in the background there's no stutter but objects can pop in.",
+      "choices": [
+        { "label": "Wait for them", "set": { "Launcher/wait_for_shaders": "1" } },
+        { "label": "Build in the background", "set": { "Launcher/wait_for_shaders": "0" } }
+      ],
+      "defaults": { "Launcher/wait_for_shaders": "1" }
+    },
+    {
+      "id": "volume", "label": "Volume", "group": "Audio",
+      "slider": { "key": "Audio/volume", "min": 0, "max": 200, "step": 5, "format": "%g" },
+      "defaults": { "Audio/volume": "100" }
+    },
+    {
+      "id": "mouse_look", "label": "Mouse Aim", "group": "Controls",
+      "help": "The mouse aims and turns the camera while the game window has focus.",
+      "choices": [
+        { "label": "On", "set": { "Input/mouse_look": "1" } },
+        { "label": "Off", "set": { "Input/mouse_look": "0" } }
+      ],
+      "defaults": { "Input/mouse_look": "1" }
+    },
+    {
+      "id": "mouse_sensitivity", "label": "Mouse Sensitivity", "group": "Controls",
+      "help": "In percent: how far the camera turns for the same mouse movement.",
+      "slider": { "key": "Input/mouse_sensitivity", "min": 10, "max": 400, "step": 5, "format": "%g" },
+      "defaults": { "Input/mouse_sensitivity": "100" }
+    },
+    {
+      "id": "mouse_invert_y", "label": "Invert Mouse Y", "group": "Controls",
+      "choices": [
+        { "label": "Off", "set": { "Input/mouse_invert_y": "0" } },
+        { "label": "On", "set": { "Input/mouse_invert_y": "1" } }
+      ],
+      "defaults": { "Input/mouse_invert_y": "0" }
+    },
+    {
+      "id": "rumble", "label": "Rumble", "group": "Controls",
+      "help": "In percent: 0 turns it off.",
+      "slider": { "key": "Input/rumble", "min": 0, "max": 200, "step": 10, "format": "%g" },
+      "defaults": { "Input/rumble": "100" }
+    },
+    {
+      "id": "keys", "label": "Keyboard", "group": "Controls",
+      "help": "Esc always opens the game's menu (-) and F1 the recomp's menu.",
+      "bindings": {
+        "separator": ", ",
+        "max": 2,
+        "names": { "Return": "Enter" },
+        "actions": [
+          { "label": "Move forward", "key": "Input/key_lstick_up" },
+          { "label": "Move back", "key": "Input/key_lstick_down" },
+          { "label": "Move left", "key": "Input/key_lstick_left" },
+          { "label": "Move right", "key": "Input/key_lstick_right" },
+          { "label": "Fire (A)", "key": "Input/key_a" },
+          { "label": "Jump (B)", "key": "Input/key_b" },
+          { "label": "Visors (X)", "key": "Input/key_x" },
+          { "label": "Morph Ball (Y)", "key": "Input/key_y" },
+          { "label": "Lock on (ZL)", "key": "Input/key_zl" },
+          { "label": "Missile (R)", "key": "Input/key_r" },
+          { "label": "L", "key": "Input/key_l" },
+          { "label": "ZR", "key": "Input/key_zr" },
+          { "label": "+", "key": "Input/key_plus" },
+          { "label": "-", "key": "Input/key_minus" },
+          { "label": "D-pad up", "key": "Input/key_dpad_up" },
+          { "label": "D-pad down", "key": "Input/key_dpad_down" },
+          { "label": "D-pad left", "key": "Input/key_dpad_left" },
+          { "label": "D-pad right", "key": "Input/key_dpad_right" },
+          { "label": "Look up", "key": "Input/key_rstick_up" },
+          { "label": "Look down", "key": "Input/key_rstick_down" },
+          { "label": "Look left", "key": "Input/key_rstick_left" },
+          { "label": "Look right", "key": "Input/key_rstick_right" }
+        ]
+      },
+      "defaults": {
+        "Input/key_lstick_up": "W, Up", "Input/key_lstick_down": "S, Down", "Input/key_lstick_left": "A, Left", "Input/key_lstick_right": "D, Right",
+        "Input/key_a": "Enter", "Input/key_b": "Space", "Input/key_x": "E, Alt", "Input/key_y": "Ctrl", "Input/key_zl": "Shift", "Input/key_r": "F",
+        "Input/key_l": "Q", "Input/key_zr": "-", "Input/key_plus": "R", "Input/key_minus": "Tab, Grave",
+        "Input/key_dpad_up": "3", "Input/key_dpad_down": "4", "Input/key_dpad_left": "2", "Input/key_dpad_right": "1",
+        "Input/key_rstick_up": "I", "Input/key_rstick_down": "K", "Input/key_rstick_left": "J", "Input/key_rstick_right": "L"
+      }
+    },
+    {
+      "id": "renderer", "label": "Renderer", "group": "Advanced",
+      "help": "OpenGL is the tested path. Native Vulkan is experimental and falls back to OpenGL if it can't start. Applies on the next start.",
+      "choices": [
+        { "label": "OpenGL", "set": { "Graphics/renderer": "opengl" } },
+        { "label": "OpenGL, shown through Vulkan", "set": { "Graphics/renderer": "vulkan" } },
+        { "label": "Native Vulkan (experimental)", "set": { "Graphics/renderer": "vulkan_native" } }
+      ],
+      "defaults": { "Graphics/renderer": "opengl" }
+    }
+  ]
+}

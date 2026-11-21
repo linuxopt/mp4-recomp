@@ -1,5 +1,7 @@
 # Metroid Prime 4 Recomp
 
+<a href="https://recomplauncher.com/game/mp4-recomp"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 A native Linux build of **your own copy** of *Metroid Prime 4: Beyond*, packaged as a single AppImage. It is built
 on the SwitchRecomp runtime by MZ Labs: the game's Switch code is recompiled ahead of time into a native Linux library on your machine, and the
 Switch GPU's work is translated to OpenGL 4.6.
@@ -130,6 +132,16 @@ the game code (a few minutes). Downloads use the system's libcurl (the `curl` pa
 check happens when you open the Play screen (`--launcher`). Builds before 2026-11-04 have no updater: download that
 release once by hand. The Windows build checks the same way: it downloads `update-<version>.zip` and `update.txt` from this
 repository's latest release, checks each file's size and SHA-256 and puts the new files in place.
+
+### RecompLauncher
+
+[RecompLauncher](https://recomplauncher.com/game/mp4-recomp) installs and updates the game from these releases, on Windows
+and Linux. It asks for your game file, the update and your `prod.keys`, builds the game in its own folder, shows the main
+settings on the game's page and starts the game straight away; its own updates replace the Play screen's. What it does is
+in `recomplauncher.json`, which every release carries (next to the EXE, and inside the AppImage). The build is the same
+setup as the Play screen's, run with no window: `"Metroid Prime 4 Beyond" --prepare --base GAME [--update UPDATE]
+[--keys prod.keys]` prints `progress <0-1> <text>` lines and exits with 0 once the game is built. With the game already
+installed (a new release whose recompiler changed) it rebuilds from the installed game files.
 
 ## Saves
 

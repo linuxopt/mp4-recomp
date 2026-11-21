@@ -141,6 +141,23 @@ def update_files(out, version):
     print('update: %s (%.1f MB, %d files) + update.txt' % (pz, os.path.getsize(pz) / 2**20, len(own)))
 
 
+def launcher_profile(dst):
+    """recomplauncher.json next to the EXE (RecompLauncher's setup and settings), with prepare.version set to a hash of the
+    recompiler folder (Python left out): a release whose recompiler changed has the launcher run its setup step again,
+    as the Play screen's updater asks for a rebuild"""
+    rc = os.path.join(dst, 'recompiler'); h = hashlib.sha256()
+    for dp, dn, fn in os.walk(rc):
+        dn[:] = sorted(d for d in dn if d not in ('python', '__pycache__'))
+        for n in sorted(fn):
+            p = os.path.join(dp, n)
+            with open(p, 'rb') as f:
+                h.update(os.path.relpath(p, rc).replace(os.sep, '/').encode() + b'\0' + hashlib.sha256(f.read()).digest())
+    text = open(os.path.join(ROOT, 'recomplauncher.json'), encoding='utf-8').read()
+    if text.count('"RECOMPILER_ID"') != 1:
+        raise SystemExit('recomplauncher.json has no prepare.version to fill in')
+    open(os.path.join(dst, 'recomplauncher.json'), 'w', encoding='utf-8', newline='\n').write(text.replace('"RECOMPILER_ID"', '"%s"' % h.hexdigest()[:16]))
+
+
 def release(out, exe, version):
     dst = os.path.join(out, 'Metroid Prime 4 Beyond')
     if os.path.exists(dst):
@@ -166,6 +183,7 @@ def release(out, exe, version):
     open(os.path.join(lic, 'zlib-and-SDL2.txt'), 'w').write(ZLIB_TXT)
     open(os.path.join(lic, 'GCC-binutils-MinGW.txt'), 'w').write(GCC_TXT)
     open(os.path.join(dst, 'README.txt'), 'w', newline='\r\n').write(README)
+    launcher_profile(dst)
     update_files(out, version)
     # one zip to download
     z = os.path.join(out, 'MetroidPrime4Recomp-PC-v%s.zip' % version)

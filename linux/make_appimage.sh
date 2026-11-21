@@ -110,6 +110,9 @@ best = max((struct.unpack_from('<BBBBHHII', d, 6 + 16 * i) for i in range(n)), k
 open(sys.argv[2], 'wb').write(d[best[7]:best[7] + best[6]])
 EOF
 ln -sf metroid-prime-4-recomp.png "$A/.DirIcon"
+# RecompLauncher reads /recomplauncher.json from the AppImage: its setup step runs again when the recompiler ID changes
+sed "s/\"RECOMPILER_ID\"/\"$RID\"/" "$W/recomplauncher.json" > "$A/recomplauncher.json"
+grep -q "\"version\": \"$RID\"" "$A/recomplauncher.json" || { echo "error: recomplauncher.json has no prepare.version to fill in" >&2; exit 1; }
 
 mkdir -p "$(dirname "$OUT")"
 du -sh "$R/gcc" "$R/python" "$A"
