@@ -462,9 +462,28 @@ static bool menu_frame(int w, int h) {
     return true;
 }
 
+// test only: SWR_TEST_ROWS="FROM,TO,PATH" appends the window's middle row of pixels for every frame presented while the guest
+// frame is in FROM..TO: the frame (u32), the width (u32), width x RGB. A row costs a fraction of a millisecond, so the game keeps
+// its frame rate; how far the view shifts sideways from row to row shows on which frames the camera turned
+static void test_window_rows() {
+    static const char* s = getenv("SWR_TEST_ROWS"); static long from = -1, to = -1; static FILE* f; static bool init;
+    if (!s) return;
+    if (!init) { init = true; char* e; from = strtol(s, &e, 10); if (*e == ',') to = strtol(e + 1, &e, 10); if (*e == ',') f = fopen(e + 1, "wb"); }
+    if (!f || g_frames < from) return;
+    if (g_frames > to) { fclose(f); f = nullptr; return; }
+    typedef void (APIENTRY * RP)(int, int, int, int, unsigned, unsigned, void*); typedef void (APIENTRY * BindFB)(unsigned, unsigned);
+    static RP rp = (RP)backend_gl_proc("glReadPixels"); static BindFB bind = (BindFB)backend_gl_proc("glBindFramebuffer");
+    int w = 1, h = 1; backend_window_size(&w, &h); if (!rp || !bind) return;
+    bind(0x8CA8, 0);   // GL_READ_FRAMEBUFFER = the window
+    std::vector<unsigned char> px((size_t)w * 3); rp(0, h / 2, w, 1, 0x1907, 0x1401, px.data());
+    unsigned hd[2] = {(unsigned)g_frames, (unsigned)w}; fwrite(hd, 4, 2, f); fwrite(px.data(), 1, px.size(), f);
+    gpu_gl_state_dirty();
+}
+
 extern "C" void ov_gl_frame(void) {
     if (g_snxvk_on) return;   // the native Vulkan renderer draws the menu (ov_vk_frame)
     test_window_shot();
+    test_window_rows();
     int w = 1, h = 1; backend_window_size(&w, &h);
     if (!menu_frame(w, h)) return;
     // draw into the window's framebuffer (with renderer=vulkan the runtime redirects framebuffer 0 to the image Vulkan presents)

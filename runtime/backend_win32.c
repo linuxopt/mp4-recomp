@@ -520,6 +520,9 @@ static void cursor_menu_sync(void){
   static int was=-1; int open=ov_is_open();
   if(open!=was){ was=open; PostMessageA(g_hwnd,WM_APP+13,0,0); } }
 
+/* the main loop between its 60 Hz passes (rt.h) */
+void video_wait_until(u64 deadline){ u64 now=plat_ns(); if(deadline>now) plat_sleep_ns((i64)(deadline-now)); }
+
 void video_poll(void){
   u64 k=0, b=0; i32 lx, ly, rx, ry;
   kbm_keyboard(&k,&lx,&ly,&rx,&ry);

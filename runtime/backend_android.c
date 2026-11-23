@@ -144,6 +144,9 @@ static int handle_event(AInputEvent* ev){
 
 static i32 axis(float v){ if(fabsf(v)<0.12f) return 0; if(v>1) v=1; if(v<-1) v=-1; return (i32)(v*32767); }
 
+/* the main loop between its 60 Hz passes (rt.h) */
+void video_wait_until(u64 deadline){ u64 now=plat_ns(); if(deadline>now) plat_sleep_ns((i64)(deadline-now)); }
+
 void video_poll(void){
   pthread_mutex_lock(&g_mx);
   if(g_queue_att && (g_queue_att!=g_queue || g_queue_dying)){ AInputQueue_detachLooper(g_queue_att); g_queue_att=NULL; g_queue_dying=0; pthread_cond_broadcast(&g_cv); }

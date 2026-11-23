@@ -325,8 +325,20 @@ int kbm_capture_take(char* out, int cap){
 /* ---------------------------------------------------------------- mouse */
 /* movement since the last poll and the buttons held (bit per KBM_MOUSE_*); any thread adds, the input thread takes */
 static volatile int g_mouse_dx, g_mouse_dy, g_mouse_held, g_mouse_tapped;
+/* 1 while mouse aim takes the counts (kbm_mouse sets it each poll): movement then goes to the game's look update as it
+   arrives, not with the next 60 Hz poll, so at any frame rate every frame turns by what the mouse moved since the last */
+static volatile int g_aim_direct;
+/* what went straight to it since the last poll: when that poll finds mouse aim stopped (lock-on, morph ball), the game
+   didn't take it, and it moves the stick instead, as it would have without the hand-off */
+static volatile int g_aim_recent[2];
+static int aim_add(int dx, int dy);
 
 void kbm_mouse_motion(int dx, int dy){
+  if(__atomic_load_n(&g_aim_direct, __ATOMIC_ACQUIRE) && aim_add(dx, dy)){
+    __atomic_fetch_add(&g_aim_recent[0], dx, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&g_aim_recent[1], dy, __ATOMIC_RELAXED);
+    return;
+  }
   __atomic_fetch_add(&g_mouse_dx, dx, __ATOMIC_RELAXED);
   __atomic_fetch_add(&g_mouse_dy, dy, __ATOMIC_RELAXED);
 }
@@ -433,7 +445,26 @@ static int aim_live(void){
   return g_aim_idle < KBM_AIM_LIVE_POLLS;
 }
 
+int kbm_aim_direct_on(void){
+  static int on = -1;
+  if(on < 0){ const char* e = getenv("SWR_MOUSE_POLL_60"); on = !(e && *e == '1'); if(!on) LOG("input: SWR_MOUSE_POLL_60=1, mouse aim gets the movement with the 60 Hz poll\n"); }
+  return on;
+}
+
+int kbm_aim_test_state(u32* steps){
+  *steps = g_aim.steps ? __atomic_load_n(g_aim.steps, __ATOMIC_RELAXED) : 0;
+  return g_aim.pend ? __atomic_load_n(&g_aim.pend[0], __ATOMIC_RELAXED) : 0;
+}
+
+static int aim_add(int dx, int dy){
+  if(!g_aim.pend) return 0;
+  if(dx) __atomic_fetch_add(&g_aim.pend[0], dx, __ATOMIC_RELAXED);
+  if(dy) __atomic_fetch_add(&g_aim.pend[1], dy, __ATOMIC_RELAXED);
+  return 1;
+}
+
 static void aim_drop(void){
+  __atomic_store_n(&g_aim_direct, 0, __ATOMIC_RELEASE);
   if(!g_aim.pend) return;
   for(int i = 0; i < 2; i++) __atomic_store_n(&g_aim.pend[i], 0, __ATOMIC_RELAXED);
 }
@@ -454,9 +485,12 @@ static float look_axis(int counts, float gain, float dead){
 void kbm_mouse(u64* buttons, i32* rx, i32* ry, int active){
   int dx = __atomic_exchange_n(&g_mouse_dx, 0, __ATOMIC_RELAXED);
   int dy = __atomic_exchange_n(&g_mouse_dy, 0, __ATOMIC_RELAXED);
+  int rdx = __atomic_exchange_n(&g_aim_recent[0], 0, __ATOMIC_RELAXED);
+  int rdy = __atomic_exchange_n(&g_aim_recent[1], 0, __ATOMIC_RELAXED);
   int held = __atomic_load_n(&g_mouse_held, __ATOMIC_RELAXED) | __atomic_exchange_n(&g_mouse_tapped, 0, __ATOMIC_RELAXED);
   mouse_test(&dx, &dy, &held);
   int live = aim_live();
+  if(!live){ dx += rdx; dy += rdy; }   /* went straight to mouse aim, which has stopped: its counts are dropped below */
   if(!active || !g_opt_mouse_look){ aim_drop(); return; }
   mouse_map();
   for(int i = 0; i < KBM_MOUSE_COUNT; i++)
@@ -465,8 +499,8 @@ void kbm_mouse(u64* buttons, i32* rx, i32* ry, int active){
     float deg = KBM_AIM_DEG_PER_COUNT * (float)g_opt_mouse_sens / 100.0f;
     g_aim.deg[0] = deg;
     g_aim.deg[1] = g_opt_mouse_invert_y ? -deg : deg;
-    if(dx) __atomic_fetch_add(&g_aim.pend[0], dx, __ATOMIC_RELAXED);
-    if(dy) __atomic_fetch_add(&g_aim.pend[1], dy, __ATOMIC_RELAXED);
+    aim_add(dx, dy);   /* counts from before the direct hand-off was on, and test input */
+    if(kbm_aim_direct_on()) __atomic_store_n(&g_aim_direct, 1, __ATOMIC_RELEASE);
     if(dx || dy){ static int said; if(!said){ said = 1; LOG("input: mouse aim in use (look multiplier %g)\n", (double)*g_aim.mult); } }
     return;
   }

@@ -185,6 +185,10 @@ downloaded to a PC.
   none), and `mouse_buttons` sets what the left, right, middle, back and forward buttons press (default
   `a,zl,r,-,-`, `-` for nothing). On Windows with `fast_forward=1`, **Tab** toggles fast forward instead.
   **Esc** doesn't quit: close the window, or use QUIT GAME in the F1 menu.
+- **1:1 mouse aim** (the mouse turns the first-person camera by a fixed angle, like a PC shooter) runs inside the game's
+  motion-control aiming, so it needs the game's own **Settings > Controls > Camera > Enable Motion Controls** turned on.
+  With it off the mouse moves the right stick instead. Mouse movement reaches the game on every frame at any frame
+  rate (`SWR_MOUSE_POLL_60=1` brings back the old 60-a-second updates, which made aiming above 60 fps feel like 60).
 - **F1** or the Home / Guide button opens the in-game menu (settings, cheats, FOV, upscaling).
 - **F3** saves a screenshot to `captures/`, **F4** toggles the 60 fps limit, **F5** writes a frame trace for bug
   reports, **F11** toggles fullscreen.
@@ -404,7 +408,13 @@ from the same save), traced to a root cause and checked again in the game.
 
 - **Input recording and replay:** every session records controller input to `input_record.csv`; `SWR_TEST_SCRIPT`
   replays it frame by frame, with `SWR_TEST_CAPTURE_FRAMES` / `SWR_TEST_CAPTURE_PREFIX` for frame captures and
-  `SWR_TEST_EXIT_FRAME` to stop. This is how most bugs above were reproduced without the player.
+  `SWR_TEST_EXIT_FRAME` to stop. This is how most bugs above were reproduced without the player. A replay never takes
+  the mouse pointer.
+- **Mouse aim per frame** (Linux): `SWR_TEST_MOUSE_HZ=1000` (from guest frame `SWR_TEST_MOUSE_FROM`, where the replay's
+  input stops) sends the window that many one-count mouse movements a second and logs, each second, the game's look
+  updates and how many found no new movement. `SWR_TEST_ROWS=FROM,TO,PATH` writes the window's middle row of pixels for
+  every frame in that range, cheap enough to keep the frame rate, so the sideways shift from frame to frame shows on
+  which frames the camera turned.
 - **Frame traces** (F5, or `SWR_TRACE=<frame>`): every draw with its shaders, textures (including the raw descriptor
   words), buffers and a render-target snapshot.
 - **`SWR_SHADER_OVERRIDE_DIR=dir`** compiles `dir/<hash>_vs.glsl` (or `_fs`, `_gs`) instead of the translation, to test a
@@ -457,6 +467,7 @@ Environment variables for testing and for turning individual fixes off if one ev
 | `SWR_NO_SCAN_WAKE=1` | scanner keeps its fixed schedule |
 | `SWR_NO_MEM_PREBUILD=1` | turn the shader pre-build off |
 | `SWR_INSTANCE_FETCH=0` | let the driver fetch per-instance vertex data (radeonsi; the old path) |
+| `SWR_MOUSE_POLL_60=1` | mouse aim gets the mouse's movement with the 60 Hz input poll (the old path) |
 | `SWR_NO_PREBUILD_INTTEX=1` | pre-build plain variants only |
 | `SWR_NO_NAN_GUARD=1` | keep NaN pixel outputs |
 | `SWR_ASTC_SYNC=1` | decode ASTC on the GPU thread |

@@ -71,6 +71,9 @@ static u64 keymap(KeySym k){
     case XK_Left: return 1ull<<12; case XK_Up: return 1ull<<13; case XK_Right: return 1ull<<14; case XK_Down: return 1ull<<15; }
   return 0; }
 
+/* the main loop between its 60 Hz passes (rt.h) */
+void video_wait_until(u64 deadline){ u64 now=plat_ns(); if(deadline>now) plat_sleep_ns((i64)(deadline-now)); }
+
 void video_poll(void){
   while(XPending(dpy)){ XEvent e; XNextEvent(dpy,&e);
     if(e.type==KeyPress){ KeySym k=XLookupKeysym(&e.xkey,0); if(k==XK_Escape) g_quit=1; keys_held|=keymap(k); }

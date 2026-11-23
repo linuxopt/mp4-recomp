@@ -79,6 +79,10 @@ typedef struct {
   volatile float* mult;        /* the game's look multiplier at the last one */
 } KbmAim;
 void kbm_aim_bind(const KbmAim* aim);
+/* 1 = movement reaches mouse aim as it comes (the default); 0 with SWR_MOUSE_POLL_60=1: with the 60 Hz poll, as before */
+int kbm_aim_direct_on(void);
+/* test only (backend_x11.c SWR_TEST_MOUSE_HZ): the counts mouse aim hasn't taken yet (x), and its look updates so far */
+int kbm_aim_test_state(u32* steps);
 
 void mouse_map_reset(void);              /* [Input] mouse_buttons changed (main.c ini_apply) */
 

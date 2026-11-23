@@ -277,6 +277,9 @@ extern volatile int g_quit;
 void video_init(const char* title);
 void video_present_rgba(const u32* px, int w, int h, int stride);   /* final RGBA8 image */
 void video_poll(void);
+/* the main loop between its 60 Hz passes: until plat_ns() reaches deadline. X11 handles the window's events meanwhile
+   (mouse motion for mouse aim); the others sleep, their windows having their own thread or none */
+void video_wait_until(u64 deadline);
 int  video_has_gl(void);
 void backend_ini(const char* k, const char* v);
 void frontend_frame(void);

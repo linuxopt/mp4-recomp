@@ -937,7 +937,7 @@ int swr_main(int argc, char** argv){
     { static int last_frames=-1, still=0, dumps=0; if(g_frames!=last_frames){ last_frames=g_frames; still=0; }
       else if(++still==60*15 && dumps<4){ dumps++; still=0; extern void kernel_dump_threads(void);
         LOG("warning: %d s without a new image (frames=%d, GPU submits=%llu)\n",15,g_frames,(unsigned long long)g_gpu_submits); kernel_dump_threads(); } }
-    next+=16666667ull; u64 now=plat_ns(); if(next>now) plat_sleep_ns((i64)(next-now)); else if(now-next>100000000ull) next=now;
+    next+=16666667ull; u64 now=plat_ns(); if(next>now) video_wait_until(next); else if(now-next>100000000ull) next=now;
   }
   save_hints(); { extern void gpu_gl_rec_finish(void); gpu_gl_rec_finish(); } { extern void snxvk_exit(void); snxvk_exit(); } LOG("Exit.\n"); log_flush(); fflush(NULL);
   { extern void launcher_on_exit(void); launcher_on_exit(); }

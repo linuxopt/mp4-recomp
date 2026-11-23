@@ -32,6 +32,9 @@ void video_present_rgba(const u32* px, int w, int h, int stride){
   pm_unlock(&g_hl);
 }
 
+/* the main loop between its 60 Hz passes (rt.h) */
+void video_wait_until(u64 deadline){ u64 now=plat_ns(); if(deadline>now) plat_sleep_ns((i64)(deadline-now)); }
+
 void video_poll(void){
   u64 el=(plat_ns()-g_start)/1000000ull;
   g_pad.buttons= (g_buttons && el>=g_buttons_at && el<g_buttons_at+300)? g_buttons : 0;

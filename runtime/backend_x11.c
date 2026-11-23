@@ -16,8 +16,11 @@
 #include <GL/glx.h>
 #include <dlfcn.h>
 #include <time.h>
+#include <poll.h>
+#include <pthread.h>
 
 static Display* dpy; static Window win; static Atom wm_delete, a_state, a_fs; static Cursor g_blank;
+static int g_tm_hz; static volatile int g_tm_on; static void* tm_thread(void* arg);   /* test only: SWR_TEST_MOUSE_HZ, before video_poll */
 static volatile int g_ww=1280, g_wh=720; static int g_fullscreen=0, g_want_fs=1;
 static int g_seconds=0, g_maxframes=-1; static char g_shot[1024]; static u64 g_start; static u64 g_press=0, g_press_at=0, g_press_len=300;
 static char g_script[1024]; static char g_title[256]; static volatile int g_shot_req;
@@ -168,6 +171,7 @@ void video_init(const char* title){
   { extern int g_xs; if(!g_xs) XMapWindow(dpy,win); XFlush(dpy); }   /* extracting shaders (--extract-shaders): no window shown */
   sdl_load();
   g_start=plat_ns();
+  { const char* t=getenv("SWR_TEST_MOUSE_HZ"); if(t && atoi(t)>0){ g_tm_hz=atoi(t); pthread_t th; pthread_create(&th,NULL,tm_thread,NULL); pthread_detach(th); LOG("test mouse: %d events a second\n",g_tm_hz); } }
   extern void gpu_gl_start(void); gpu_gl_start();
 }
 /* GPU thread */
@@ -294,7 +298,8 @@ static void mouse_warp_centre(void){
   g_warping=1; XWarpPointer(dpy,None,win,0,0,0,0,g_ww/2,g_wh/2); XFlush(dpy); }
 static void mouse_grab_sync(void){
   static u64 retry;
-  int want= kbm_mouse_look_enabled() && g_focused && !ov_is_open();
+  static int test=-1; if(test<0) test= getenv("SWR_TEST_SCRIPT")!=NULL;   /* a replay never takes the player's pointer */
+  int want= !test && kbm_mouse_look_enabled() && g_focused && !ov_is_open();
   if(want && !g_grabbed){
     u64 now=plat_ns(); if(now-retry<250000000ull) return;   /* a refused grab is tried again 4 times a second */
     retry=now;
@@ -376,7 +381,7 @@ static void test_input_apply(u64* b, i32* lx, i32* ly, i32* rx, i32* ry){
   { static int done; const char* se; if(!done && (se=getenv("SWR_TEST_SETENV")) && *se){ u32 at=(u32)strtoul(se,NULL,10); const char* kv=strchr(se,':');
       if(!kv) done=1; else if(frame>=at){ char k[64]; const char* eq=strchr(kv+1,'=');
         if(eq && eq-kv-1<64){ memcpy(k,kv+1,eq-kv-1); k[eq-kv-1]=0; setenv(k,eq+1,1); LOG("test: frame %u set %s=%s\n",frame,k,eq+1); } done=1; } } }
-  if(test_replay){ while(test_i+1<test_n && test_inputs[test_i+1].frame<=frame) test_i++; TestInput* v=&test_inputs[test_i];
+  if(test_replay && !g_tm_on){ while(test_i+1<test_n && test_inputs[test_i+1].frame<=frame) test_i++; TestInput* v=&test_inputs[test_i];
     *b=v->buttons; *lx=v->lx; *ly=v->ly; *rx=v->rx; *ry=v->ry; }
 }
 static void test_frame_hooks(void){
@@ -391,14 +396,43 @@ static void test_frame_hooks(void){
   const char* stop=getenv("SWR_TEST_EXIT_FRAME"); if(stop && (u64)g_frames>=strtoull(stop,NULL,10)){ LOG("test complete: frame=%d\n",g_frames); { extern void plat_sample_dump(void); plat_sample_dump(); } extern void save_hints(void); save_hints(); log_flush(); fflush(NULL); _exit(0); }
 }
 
-void video_poll(void){
-  { int r=g_fs_req; if(r>=0){ g_fs_req=-1; set_fullscreen(r); } }
-  cursor_sync();
+/* test only: SWR_TEST_MOUSE_HZ=N (from guest frame SWR_TEST_MOUSE_FROM) has a thread send the window N MotionNotify events a second, each standing for one count
+   of mouse movement to the right, which the event loop gives to the input layer as a real one would be (kbm_mouse_motion).
+   Real mouse events are never taken this way, and the pointer is never moved. Once a second it logs the game's look
+   updates (mouse aim's steps), how many of them found no new count, and how long the events waited to be read */
+static volatile u64 g_tm_lat_sum, g_tm_lat_max, g_tm_lat_n;
+static void tm_event(const XMotionEvent* m){   /* the main thread, from x_events */
+  u64 now=plat_ns()/100000ull, sent=(u64)m->time; u64 lat=((u32)now-(u32)sent)&0xFFFFFFFFull;   /* 0.1 ms units */
+  __atomic_fetch_add(&g_tm_lat_sum,lat,__ATOMIC_RELAXED); __atomic_fetch_add(&g_tm_lat_n,1,__ATOMIC_RELAXED);
+  u64 mx=__atomic_load_n(&g_tm_lat_max,__ATOMIC_RELAXED); while(lat>mx && !__atomic_compare_exchange_n(&g_tm_lat_max,&mx,lat,0,__ATOMIC_RELAXED,__ATOMIC_RELAXED)) {}
+  kbm_mouse_motion(1,0); }
+static void* tm_thread(void* arg){
+  (void)arg; Display* d=XOpenDisplay(NULL); if(!d){ WARN("test mouse: no second X connection\n"); return NULL; }
+  { const char* f=getenv("SWR_TEST_MOUSE_FROM"); int from= f? atoi(f) : 0;   /* the guest frame to start at: a route replays undisturbed before */
+    while(g_frames<from) plat_sleep_ns(5000000); g_tm_on=1; LOG("test mouse: started at frame %d (the replay's input stops)\n",g_frames); }
+  u64 period=1000000000ull/(u64)g_tm_hz, next=plat_ns(), sec=next+1000000000ull; u32 steps0; int pend0=kbm_aim_test_state(&steps0);
+  u32 steps=0, empty=0, sent=0;
+  for(;;){
+    u32 s; int p=kbm_aim_test_state(&s);
+    if(s!=steps0){ u32 n=s-steps0; steps+=n; empty+= p<pend0? n-1 : n; steps0=s; }   /* a drop in what is pending: a step took counts */
+    XEvent e; memset(&e,0,sizeof e); e.xmotion.type=MotionNotify; e.xmotion.display=d; e.xmotion.window=win; e.xmotion.same_screen=True;
+    e.xmotion.time=(Time)(u32)(plat_ns()/100000ull);
+    XSendEvent(d,win,False,PointerMotionMask,&e); XFlush(d); sent++;
+    pend0=kbm_aim_test_state(&s);
+    u64 now=plat_ns();
+    if(now>=sec){ u64 n=__atomic_exchange_n(&g_tm_lat_n,0,__ATOMIC_RELAXED), sum=__atomic_exchange_n(&g_tm_lat_sum,0,__ATOMIC_RELAXED), mx=__atomic_exchange_n(&g_tm_lat_max,0,__ATOMIC_RELAXED);
+      LOG("test mouse: %u events sent, %llu read (waited %.2f ms on average, %.2f at most); %u look updates, %u of them with no new count\n",
+          sent,(unsigned long long)n,n? sum/(double)n/10.0 : 0.0,mx/10.0,steps,empty);
+      sent=steps=empty=0; sec+=1000000000ull; }
+    next+=period; now=plat_ns(); if(next>now) plat_sleep_ns((i64)(next-now)); else next=now; }
+  return NULL; }
+
+static void x_events(void){
   while(XPending(dpy)){ XEvent e; XNextEvent(dpy,&e);
     if(e.type==KeyPress) key_down(&e.xkey);
     else if(e.type==KeyRelease){ KeySym k=XLookupKeysym(&e.xkey,0); int kk=kbm_from_xkey(k,e.xkey.keycode); key_once(k,0); kbm_key(kk,0); if(k==XK_Escape) kbm_menu_key(0);
       if(!kbm_capture_key(kk,0) && ov_is_open()) ov_input_key(ovk_from_keysym(k),0); }
-    else if(e.type==MotionNotify) mouse_motion(e.xmotion.x,e.xmotion.y);
+    else if(e.type==MotionNotify){ if(g_tm_hz && e.xmotion.send_event) tm_event(&e.xmotion); else mouse_motion(e.xmotion.x,e.xmotion.y); }
     else if(e.type==ButtonPress || e.type==ButtonRelease){ unsigned bt=e.xbutton.button; int down= e.type==ButtonPress;
       kbm_mouse_button(kbm_from_xbutton(bt),down);   /* the game ignores it while the menu is open (kbm_mouse) */
       if(!g_grabbed) ov_input_mouse((float)e.xbutton.x,(float)e.xbutton.y);
@@ -406,7 +440,24 @@ void video_poll(void){
     else if(e.type==FocusIn) g_focused=1;
     else if(e.type==FocusOut){ g_focused=0; kbm_release_all(); }
     else if(e.type==ConfigureNotify){ g_ww=e.xconfigure.width>0? e.xconfigure.width : 1; g_wh=e.xconfigure.height>0? e.xconfigure.height : 1; }
-    else if(e.type==ClientMessage && (Atom)e.xclient.data.l[0]==wm_delete){ LOG("window: closed by the user\n"); g_quit=1; } }
+    else if(e.type==ClientMessage && (Atom)e.xclient.data.l[0]==wm_delete){ LOG("window: closed by the user\n"); g_quit=1; } } }
+
+/* the main loop between its 60 Hz passes (main.c), instead of a sleep: the window's events as they come, so mouse motion
+   reaches mouse aim (input_kbm.c) within the frame it happens at any frame rate, not once a pass */
+void video_wait_until(u64 deadline){
+  if(!kbm_aim_direct_on()){ u64 now=plat_ns(); if(deadline>now) plat_sleep_ns((i64)(deadline-now)); return; }   /* SWR_MOUSE_POLL_60=1 */
+  int fd=ConnectionNumber(dpy);
+  for(;;){
+    x_events();
+    u64 now=plat_ns(); if(now>=deadline) return;
+    u64 w=deadline-now; int ms=(int)(w/1000000ull);
+    if(!ms){ plat_sleep_ns((i64)w); return; }   /* under a millisecond left: the next pass reads what comes meanwhile */
+    struct pollfd p={fd,POLLIN,0}; poll(&p,1,ms); } }
+
+void video_poll(void){
+  { int r=g_fs_req; if(r>=0){ g_fs_req=-1; set_fullscreen(r); } }
+  cursor_sync();
+  x_events();
   mouse_grab_sync();
   u64 k=0, b=0; i32 lx, ly, rx, ry;
   kbm_keyboard(&k,&lx,&ly,&rx,&ry);
